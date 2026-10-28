@@ -119,3 +119,40 @@ def test_wide_polygon_across_the_antimeridian_is_refused():
         e = s.error_of('divide-equal', {'parts': 2, 'angle': 90})
         check('span 30.0° of longitude' in e, e)
         check(s.features('amw') == before, 'a refusal changed data')
+
+
+def test_implicit_target_across_the_antimeridian():
+    # the targets come from the active layer itself: a tool at 179.95°E finds the polygon
+    # running from 179.9°E to 179.9°W although their lon/lat boxes don't meet
+    tool = {'type': 'Polygon', 'coordinates': [ring(179.94, 179.96, LAT + 0.02, LAT + 0.04)]}
+    far = {'type': 'Polygon', 'coordinates': [ring(-179.5, -179.4)]}
+    pl = write_layer('amc', [feature(across(), name='a'), feature(far, name='far'), feature(tool, name='t')])
+    with Session(pl) as s:
+        before = s.features('amc')
+        s.activate('amc')
+        s.select('amc', [2])
+        r = s.plugin('cut-with-polygon', {'keepTools': True})
+        after = s.features('amc')
+    check(r['changed'] == 1, r)
+    by_name = {f['properties']['name']: f['geometry'] for f in after}
+    old = {f['properties']['name']: f['geometry'] for f in before}
+    check(by_name['far'] == old['far'] and by_name['t'] == old['t'], 'a feature away from the cut changed')
+    cut = by_name['a']
+    check(cut['type'] == 'Polygon' and len(cut['coordinates']) == 2, 'no hole cut: %s' % cut)
+    want = area_ell(unwrapped(old['a'])) - area_ell(tool)
+    got = area_ell(unwrapped(cut))
+    check(abs(got - want) <= 1e-4 * want, 'area %.1f m², want %.1f m²' % (got, want))
+
+
+def test_implicit_target_away_from_the_tool_is_not_found():
+    # a tool just west of the polygon across the antimeridian, and one far east of it
+    for lon0, lon1 in ((179.8, 179.85), (-179.5, -179.45)):
+        tool = {'type': 'Polygon', 'coordinates': [ring(lon0, lon1, LAT + 0.02, LAT + 0.04)]}
+        pl = write_layer('amn', [feature(across(), name='a'), feature(tool, name='t')])
+        with Session(pl) as s:
+            before = s.features('amn')
+            s.activate('amn')
+            s.select('amn', [1])
+            e = s.error_of('cut-with-polygon', {'keepTools': True})
+            check("none of the polygons of 'amn' touch the selected tool features" in e, e)
+            check(s.features('amn') == before, 'a refusal changed data')

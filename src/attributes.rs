@@ -639,6 +639,9 @@ fn rework(g: &Geom, op: &dyn Fn(&LineString<f64>, bool) -> Option<LineString<f64
     })
 }
 
+/// Caps vertex estimates (also NaN, which fails the comparison) well inside a 32-bit usize.
+const MAX_ESTIMATE: f64 = 1e9;
+
 fn same_geom(a: &Geom, b: &Geom) -> bool {
     if a.type_name() != b.type_name() || a.num_parts() != b.num_parts() || a.num_coords() != b.num_coords() {
         return false;
@@ -676,7 +679,7 @@ struct Tally {
 fn generalize(
     usage: &'static str,
     ctx: &Ctx,
-    vertex_factor: Option<&dyn Fn(&Geom) -> usize>,
+    vertex_factor: Option<&dyn Fn(&Geom) -> f64>,
     check_topology: bool,
     op: &dyn Fn(&LineString<f64>, bool) -> Option<LineString<f64>>,
 ) -> Res<(Tally, Dim)> {
@@ -687,7 +690,11 @@ fn generalize(
     let mut snap = VertexSnap::new(frame, SNAP_TOL_M);
     let metric: Vec<Geom> = ed.features.iter().map(|f| f.geom().map(|g| snap.project(g))).collect::<Res<_>>()?;
     if let Some(estimate) = vertex_factor {
-        budget::check_write(metric.len(), metric.iter().map(estimate).sum())?;
+        // Summed in f64: a tiny script distance gives counts far beyond usize, and a
+        // saturated or wrapped integer would slip past the budget.
+        let total: f64 = metric.iter().map(estimate).sum();
+        let total = if total < MAX_ESTIMATE { total.ceil() as usize } else { MAX_ESTIMATE as usize };
+        budget::check_write(metric.len(), total)?;
     }
     let mut t = Tally::default();
     for (f, m) in ed.features.iter().zip(&metric) {
@@ -738,37 +745,72 @@ fn segments_cross(a: Coord<f64>, b: Coord<f64>, c: Coord<f64>, d: Coord<f64>) ->
     false
 }
 
-fn point_in_ring(p: Coord<f64>, r: &LineString<f64>) -> bool {
+/// Whether `p` lies inside ring `r`; `None` when it lies on the ring.
+fn ring_side(p: Coord<f64>, r: &LineString<f64>) -> Option<bool> {
     let mut inside = false;
     for w in r.0.windows(2) {
         let (a, b) = (w[0], w[1]);
+        if orient(a, b, p) == 0.0
+            && p.x >= a.x.min(b.x)
+            && p.x <= a.x.max(b.x)
+            && p.y >= a.y.min(b.y)
+            && p.y <= a.y.max(b.y)
+        {
+            return None;
+        }
         if (a.y > p.y) != (b.y > p.y) && p.x < a.x + (p.y - a.y) / (b.y - a.y) * (b.x - a.x) {
             inside = !inside;
         }
     }
-    inside
+    Some(inside)
+}
+
+/// Whether ring `a` lies inside ring `b`, for rings that do not cross: decided by the first
+/// vertex or segment midpoint of `a` that is not on `b`, since vertices may touch.
+fn ring_inside(a: &LineString<f64>, b: &LineString<f64>) -> bool {
+    a.0.windows(2)
+        .find_map(|w| {
+            let mid = Coord { x: (w[0].x + w[1].x) / 2.0, y: (w[0].y + w[1].y) / 2.0 };
+            ring_side(w[0], b).or_else(|| ring_side(mid, b))
+        })
+        .unwrap_or(false)
+}
+
+/// (min x, min y, max x, max y) of a ring.
+fn ring_box(r: &LineString<f64>) -> [f64; 4] {
+    r.0.iter().fold([f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY], |b, c| {
+        [b[0].min(c.x), b[1].min(c.y), b[2].max(c.x), b[3].max(c.y)]
+    })
+}
+
+fn box_within(a: &[f64; 4], b: &[f64; 4]) -> bool {
+    a[0] >= b[0] && a[1] >= b[1] && a[2] <= b[2] && a[3] <= b[3]
 }
 
 /// A cheap stand-in for OGC validity, linear-ish where `geo::Validation` is quadratic and
 /// too slow for a selection: no two segments of any rings cross (touching at a vertex is
-/// allowed), and every hole starts inside its outer ring. This catches what simplifying or
-/// smoothing rings independently can break.
+/// allowed), every hole lies inside its own outer ring and outside its other holes, and an
+/// outer ring lies inside another part only within one of its holes. This catches what
+/// simplifying or smoothing rings independently can break. Containment is only tested
+/// between rings whose boxes nest, found by a sweep like the segments'.
 fn rings_simple(g: &Geom) -> bool {
     let Some(mp) = g.to_multi_polygon() else { return true };
     // (min x, max x, a, b, ring, index, segments in ring)
     let mut segs = Vec::new();
+    // per polygon, the boxes of its outer ring and holes
+    let mut boxes: Vec<Vec<[f64; 4]>> = Vec::with_capacity(mp.0.len());
     let mut ring_no = 0usize;
     for p in &mp.0 {
-        if p.interiors().iter().any(|h| h.0.first().is_some_and(|c| !point_in_ring(*c, p.exterior()))) {
-            return false;
-        }
+        let mut pb = Vec::with_capacity(p.interiors().len() + 1);
         for r in std::iter::once(p.exterior()).chain(p.interiors()) {
             let n = r.0.len().saturating_sub(1);
             for (i, w) in r.0.windows(2).enumerate() {
                 segs.push((w[0].x.min(w[1].x), w[0].x.max(w[1].x), w[0], w[1], ring_no, i, n));
             }
+            pb.push(ring_box(r));
             ring_no += 1;
         }
+        boxes.push(pb);
     }
     segs.sort_by(|a, b| a.0.total_cmp(&b.0));
     for (i, s) in segs.iter().enumerate() {
@@ -783,6 +825,45 @@ fn rings_simple(g: &Geom) -> bool {
                 }
             }
             if segments_cross(s.2, s.3, t.2, t.3) {
+                return false;
+            }
+        }
+    }
+    // ring k of polygon p: 0 is the outer ring, k > 0 hole k - 1
+    let ring = |p: usize, k: usize| if k == 0 { mp.0[p].exterior() } else { &mp.0[p].interiors()[k - 1] };
+    for (p, pb) in boxes.iter().enumerate() {
+        for k in 1..pb.len() {
+            if !box_within(&pb[k], &pb[0]) || !ring_inside(ring(p, k), ring(p, 0)) {
+                return false;
+            }
+        }
+    }
+    // `a` lying inside `b` breaks validity when both are outer rings (unless `a` sits in one of
+    // `b`'s holes) or both are holes of one polygon; other nestings follow from these.
+    let bad_nesting = |(ap, ak): (usize, usize), (bp, bk): (usize, usize)| {
+        let ab = &boxes[ap][ak];
+        if !box_within(ab, &boxes[bp][bk]) {
+            return false;
+        }
+        let ra = ring(ap, ak);
+        match (ak, bk) {
+            (0, 0) => {
+                ring_inside(ra, ring(bp, 0))
+                    && !(1..boxes[bp].len()).any(|h| box_within(ab, &boxes[bp][h]) && ring_inside(ra, ring(bp, h)))
+            }
+            (0, _) | (_, 0) => false,
+            _ => ap == bp && ring_inside(ra, ring(bp, bk)),
+        }
+    };
+    let mut order: Vec<(usize, usize)> =
+        boxes.iter().enumerate().flat_map(|(p, pb)| (0..pb.len()).map(move |k| (p, k))).collect();
+    order.sort_by(|a, b| boxes[a.0][a.1][0].total_cmp(&boxes[b.0][b.1][0]));
+    for (i, &a) in order.iter().enumerate() {
+        for &b in &order[i + 1..] {
+            if boxes[b.0][b.1][0] > boxes[a.0][a.1][2] {
+                break;
+            }
+            if bad_nesting(a, b) || bad_nesting(b, a) {
                 return false;
             }
         }
@@ -842,7 +923,7 @@ pub fn simplify(ctx: &Ctx) -> Res<Value> {
 /// Adds vertices so that no segment is longer than the panel distance.
 pub fn densify(ctx: &Ctx) -> Res<Value> {
     let d = ctx.settings.distance_m;
-    let estimate = |g: &Geom| g.num_coords() + (metric_length(g) / d).ceil() as usize;
+    let estimate = |g: &Geom| g.num_coords() as f64 + (metric_length(g) / d).ceil();
     let op = |l: &LineString<f64>, _ring: bool| Some(Euclidean.densify(l, d));
     let (t, dim) = generalize(
         "Select the lines or polygons to densify in the active layer",
@@ -858,7 +939,7 @@ pub fn densify(ctx: &Ctx) -> Res<Value> {
 /// Polygon rings stay closed and line ends stay in place.
 pub fn smooth(ctx: &Ctx) -> Res<Value> {
     let it = ctx.settings.iterations as usize;
-    let estimate = |g: &Geom| g.num_coords() << it;
+    let estimate = |g: &Geom| g.num_coords() as f64 * 2f64.powi(it as i32);
     let op = |l: &LineString<f64>, _ring: bool| Some(l.chaikin_smoothing(it));
     let (t, dim) = generalize("Select the lines or polygons to smooth in the active layer", ctx, Some(&estimate), true, &op)?;
     report(ctx, "Smoothed", &plural(it, "iteration", "iterations"), &t, dim, true)

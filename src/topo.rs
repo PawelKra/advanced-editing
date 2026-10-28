@@ -20,15 +20,17 @@
 //! Edges are straight in the working frame (EPSG:2180 in Poland, the storage CRS of Polish
 //! cadastral data; UTM elsewhere).
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::hash::{BuildHasherDefault, Hasher};
 
 use geo::Coord;
 
 use crate::geojson::{Dim, Geom, P2};
-use crate::host_io::{self, LAYER_READ_CAP, LayerInfo, Res, budget};
+use crate::host_io::budget::{self, Meter};
+use crate::host_io::{self, LAYER_READ_CAP, LayerInfo, Res};
 use crate::proj::{Frame, SNAP_TOL_M, VertexSnap};
 
 /// Result vertices this close to an original edge are put on it. Boolean ops keep their
@@ -208,9 +210,13 @@ fn mean_len(segs: &[[P2; 2]]) -> f64 {
     segs.iter().map(|s| dist(s[0], s[1])).sum::<f64>() / segs.len().max(1) as f64
 }
 
+/// The most segment-to-cell entries a grid holds (8 MB while it is built). Segments that are
+/// long for the cell size are registered in many cells; many of them along the same cells
+/// would make the grid quadratic in their number.
+const MAX_GRID_ENTRIES: usize = 1 << 20;
+
 /// Segments (points are segments of length 0) by grid cell, in flat arrays. A segment is
-/// registered in the cells of sample points at most `cell / 2` apart, so each of its points
-/// lies within `cell / 4` of a registered sample.
+/// registered in every cell it passes through.
 struct Grid {
     cell: f64,
     origin: P2,
@@ -219,18 +225,43 @@ struct Grid {
     /// Items of cell `c` are `items[start[c]..start[c + 1]]`.
     start: Vec<u32>,
     items: Vec<u32>,
+    /// The entries the grid would have needed at the cell size the extent allows and the most
+    /// it could have, when that was more and the cells were made coarser (or, for a grid
+    /// built within a budget, nothing was indexed).
+    crowded: Option<(usize, usize)>,
+    /// Segments measured and entries and cells filled while building it.
+    built: u64,
+    /// Cells and items the queries looked at so far.
+    seen: Cell<u64>,
 }
 
 impl Grid {
-    /// A grid of cells `cell` wide, or coarser when the extent would need too many.
+    /// A grid of cells `cell` wide, or coarser when the extent would need too many cells or
+    /// the segments too many entries.
     fn new(segs: &[[P2; 2]], cell: f64) -> Grid {
+        Grid::within(segs, cell, None)
+    }
+
+    /// [`Grid::new`], but with no more than `max` entries (and [`MAX_GRID_ENTRIES`]) at the
+    /// cell size the extent allows: beyond that only `crowded` is set.
+    fn within(segs: &[[P2; 2]], cell: f64, max: Option<usize>) -> Grid {
         let (mut x0, mut y0, mut x1, mut y1) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
         for s in segs {
             for q in s {
                 (x0, y0, x1, y1) = (x0.min(q[0]), y0.min(q[1]), x1.max(q[0]), y1.max(q[1]));
             }
         }
-        let mut g = Grid { cell: 1.0, origin: [x0, y0], nx: 1, ny: 1, start: vec![0, 0], items: Vec::new() };
+        let mut g = Grid {
+            cell: 1.0,
+            origin: [x0, y0],
+            nx: 1,
+            ny: 1,
+            start: vec![0, 0],
+            items: Vec::new(),
+            crowded: None,
+            built: segs.len() as u64,
+            seen: Cell::new(0),
+        };
         if segs.is_empty() {
             return g;
         }
@@ -240,25 +271,29 @@ impl Grid {
         loop {
             g.nx = ((x1 - x0) / g.cell).floor() as i64 + 1;
             g.ny = ((y1 - y0) / g.cell).floor() as i64 + 1;
-            if (g.nx as f64) * (g.ny as f64) <= cap {
+            if (g.nx as f64) * (g.ny as f64) > cap {
+                g.cell *= 2.0;
+                continue;
+            }
+            // counted before anything is allocated
+            let entries = segs.iter().map(|s| g.span(s)).sum::<usize>();
+            g.built += segs.len() as u64;
+            let most = max.map_or(MAX_GRID_ENTRIES, |m| m.min(MAX_GRID_ENTRIES));
+            if entries <= most {
                 break;
+            }
+            g.crowded.get_or_insert((entries, most));
+            if max.is_some() {
+                return g;
             }
             g.cell *= 2.0;
         }
         let mut pairs: Vec<(u32, u32)> = Vec::new();
-        let mut mine = Vec::new();
         for (k, s) in segs.iter().enumerate() {
-            mine.clear();
-            let steps = ((dist(s[0], s[1]) / (0.5 * g.cell)).ceil() as usize).max(1);
-            for i in 0..=steps {
-                let (cx, cy) = g.key(lerp(s[0], s[1], i as f64 / steps as f64));
-                mine.push((cy.clamp(0, g.ny - 1) * g.nx + cx.clamp(0, g.nx - 1)) as u32);
-            }
-            mine.sort_unstable();
-            mine.dedup();
-            pairs.extend(mine.iter().map(|&c| (c, k as u32)));
+            g.cells_of(s, |c| pairs.push((c, k as u32)));
         }
         let ncell = (g.nx * g.ny) as usize;
+        g.built += (2 * pairs.len() + ncell) as u64;
         g.start = vec![0; ncell + 1];
         for &(c, _) in &pairs {
             g.start[c as usize + 1] += 1;
@@ -279,6 +314,35 @@ impl Grid {
         (((q[0] - self.origin[0]) / self.cell).floor() as i64, ((q[1] - self.origin[1]) / self.cell).floor() as i64)
     }
 
+    fn clamped(&self, q: P2) -> (i64, i64) {
+        let (cx, cy) = self.key(q);
+        (cx.clamp(0, self.nx - 1), cy.clamp(0, self.ny - 1))
+    }
+
+    /// The cells segment `s` passes through (as [`Grid::cells_of`] counts them).
+    fn span(&self, s: &[P2; 2]) -> usize {
+        let ((ax, ay), (bx, by)) = (self.clamped(s[0]), self.clamped(s[1]));
+        ((ax - bx).abs() + (ay - by).abs() + 1) as usize
+    }
+
+    /// Calls `f` with each cell segment `s` passes through, column by column: in each, the
+    /// cells between the segment's lowest and highest point there. A cell missed by rounding
+    /// at its border is covered by the margin of [`Grid::in_box`].
+    fn cells_of(&self, s: &[P2; 2], mut f: impl FnMut(u32)) {
+        let [a, b] = if s[0][0] <= s[1][0] { *s } else { [s[1], s[0]] };
+        let ((ca, _), (cb, _)) = (self.clamped(a), self.clamped(b));
+        for cx in ca..=cb {
+            let y_at = |x: f64| if b[0] > a[0] { lerp(a, b, ((x - a[0]) / (b[0] - a[0])).clamp(0.0, 1.0))[1] } else { a[1] };
+            let left = if cx == ca { a[1] } else { y_at(self.origin[0] + cx as f64 * self.cell) };
+            let right = if cx == cb { b[1] } else { y_at(self.origin[0] + (cx + 1) as f64 * self.cell) };
+            let (_, y0) = self.clamped([a[0], lo(left, right)]);
+            let (_, y1) = self.clamped([a[0], hi(left, right)]);
+            for cy in y0..=y1 {
+                f((cy * self.nx + cx) as u32);
+            }
+        }
+    }
+
     /// Calls `f` with every segment that may lie within `r` of `q` (some several times).
     fn near(&self, q: P2, r: f64, f: impl FnMut(usize)) {
         self.in_box([q[0], q[1], q[0], q[1]], r, f);
@@ -289,14 +353,18 @@ impl Grid {
         let e = r + 0.25 * self.cell;
         let (x0, y0) = self.key([b[0] - e, b[1] - e]);
         let (x1, y1) = self.key([b[2] + e, b[3] + e]);
+        let mut seen = 0;
         for cy in y0.max(0)..=y1.min(self.ny - 1) {
             for cx in x0.max(0)..=x1.min(self.nx - 1) {
                 let c = (cy * self.nx + cx) as usize;
-                for &k in &self.items[self.start[c] as usize..self.start[c + 1] as usize] {
+                let items = &self.items[self.start[c] as usize..self.start[c + 1] as usize];
+                seen += 1 + items.len() as u64;
+                for &k in items {
                     f(k as usize);
                 }
             }
         }
+        self.seen.set(self.seen.get() + seen);
     }
 }
 
@@ -324,6 +392,10 @@ pub struct Placer {
     /// Each target's dimension.
     owners: Vec<Dim>,
     ix: CutIndex,
+    /// Result vertices that are not original ones, and new positions computed for them on
+    /// original edges, so far (see [`Placer::place_new`]).
+    moved: Cell<u64>,
+    fresh: Cell<u64>,
 }
 
 /// The target edges near some cut lines, and the cut lines. Only those edges are indexed:
@@ -331,6 +403,9 @@ pub struct Placer {
 pub struct CutIndex {
     /// Each target's metric bounding box (x0, y0, x1, y1).
     bboxes: Vec<[f64; 4]>,
+    /// Each target's (edge, cut line segment) pairs within reach of each other: about the
+    /// crossings of the cut lines with its boundary.
+    pairs: Vec<u64>,
     /// Placed positions by metric position and edge: the pieces on both sides of a cut
     /// share each crossing.
     placed: RefCell<HashMap<(u64, u64, usize), Coord<f64>, BuildHasherDefault<KeyHasher>>>,
@@ -342,24 +417,75 @@ pub struct CutIndex {
 
 /// Cut lines (metres) whose crossings with the edges a [`Placer`] computes exactly.
 pub struct Cutters {
+    /// Each segment once, however many paths repeat it (either way round).
     segs: Vec<[P2; 2]>,
-    /// (path, segment) of each of `segs`.
+    /// (path, segment) of each of `segs` where it first occurs.
     ids: Vec<(usize, usize)>,
+    /// (index in `segs`, path, segment, reversed) of the repeats, by index.
+    repeats: Vec<(usize, usize, usize, bool)>,
     /// x0, y0, x1, y1 of all of them.
     bb: [f64; 4],
     /// Only for many segments: a few are faster scanned.
     grid: Option<Grid>,
+    /// Segments scanned without the grid.
+    scanned: Cell<u64>,
 }
 
 /// Up to this many segments a scan beats a grid.
 const SCAN_SEGMENTS: usize = 32;
 
+// What snapping tools and placing results cost, in fuel: upper bounds fitted to `diag-bench`
+// runs of Cut and Split With Line on dense zigzags over each other, combs and cuts into
+// thousands of pieces.
+/// Per segment of [`Cutters`] built (hashed, and its box).
+const CUTTER_SEG_FUEL: u64 = 2_000;
+/// Per segment measured or entry or cell filled building a [`Grid`].
+const GRID_BUILD_FUEL: u64 = 350;
+/// Per cell or item a [`Grid`] query looks at (an item is measured when its box is near).
+const GRID_VISIT_FUEL: u64 = 300;
+/// Per target or tool vertex scanned against the cut lines' box.
+const INDEX_FUEL_PER_VERTEX: u64 = 60;
+/// Per (edge, cut line segment) pair found near each other, and per target edge indexed.
+const PAIR_FUEL: u64 = 1_500;
+const EDGE_FUEL: u64 = 2_000;
+/// Per tool vertex snapped (beyond its queries).
+const SNAP_FUEL_PER_VERTEX: u64 = 1_500;
+/// Per target vertex inserted into a tool, sorted.
+const INSERT_SORT_FUEL: u64 = 1_000;
+/// Per new position computed on an original edge: an inverse projection and a few forward
+/// ones (see [`inv_onto`]).
+const PLACE_FUEL: u64 = 35_000;
+/// Per result vertex that is not an original one: looked up near the edges and the tools.
+const MOVED_FUEL: u64 = 3_000;
+/// Per new vertex indexed to be found on segments: three projections and a sort.
+const LOOKUP_FUEL: u64 = 12_000;
+/// Per result segment searched for new vertices on it.
+const SHARE_FUEL_PER_SEGMENT: u64 = 1_000;
+
 impl Cutters {
     pub fn new(paths: &[Vec<P2>]) -> Cutters {
-        let (mut segs, mut ids) = (Vec::new(), Vec::new());
+        Cutters::within(paths, None)
+    }
+
+    /// Cut lines whose grid is not built when it would need more than `max` entries (see
+    /// [`Cutters::check`]): they are to be refused.
+    fn within(paths: &[Vec<P2>], max: Option<usize>) -> Cutters {
+        let (mut segs, mut ids, mut repeats): (Vec<[P2; 2]>, _, _) = (Vec::new(), Vec::new(), Vec::new());
+        let mut seen: HashMap<[u64; 4], usize, BuildHasherDefault<KeyHasher>> = HashMap::default();
         let mut bb = [f64::MAX, f64::MAX, f64::MIN, f64::MIN];
         for (pi, p) in paths.iter().enumerate() {
             for (i, w) in p.windows(2).enumerate().filter(|(_, w)| w[0] != w[1]) {
+                let [a, b] = ordered([w[0], w[1]]);
+                match seen.entry([a[0].to_bits(), a[1].to_bits(), b[0].to_bits(), b[1].to_bits()]) {
+                    Entry::Occupied(k) => {
+                        let k = *k.get();
+                        repeats.push((k, pi, i, segs[k][0] != w[0]));
+                        continue;
+                    }
+                    Entry::Vacant(v) => {
+                        v.insert(segs.len());
+                    }
+                }
                 segs.push([w[0], w[1]]);
                 ids.push((pi, i));
                 for q in [w[0], w[1]] {
@@ -367,9 +493,36 @@ impl Cutters {
                 }
             }
         }
+        repeats.sort_by_key(|r| r.0);
         // few long segments: cells as fine as the extent allows
-        let grid = (segs.len() > SCAN_SEGMENTS).then(|| Grid::new(&segs, MIN_CELL_M));
-        Cutters { segs, ids, bb, grid }
+        let grid = (segs.len() > SCAN_SEGMENTS).then(|| Grid::within(&segs, MIN_CELL_M, max));
+        Cutters { segs, ids, repeats, bb, grid, scanned: Cell::new(0) }
+    }
+
+    /// Estimated fuel of building them.
+    fn built_fuel(&self) -> u64 {
+        (self.segs.len() + self.repeats.len()) as u64 * CUTTER_SEG_FUEL
+            + self.grid.as_ref().map_or(0, |g| g.built * GRID_BUILD_FUEL)
+    }
+
+    /// Segments and cells looked at so far.
+    fn seen(&self) -> u64 {
+        self.scanned.get() + self.grid.as_ref().map_or(0, |g| g.seen.get())
+    }
+
+    /// Refuses cut lines with so many long segments close together that indexing them, or
+    /// searching the index, would be quadratic in their number.
+    fn check(&self) -> Res<()> {
+        match self.grid.as_ref().and_then(|g| g.crowded) {
+            None => Ok(()),
+            Some((n, most)) => Err(format!(
+                "The tools have too many long segments close together ({} segments; indexing them takes \
+                 about {} grid entries, one command handles {}). Select fewer tool features or simplify them.",
+                budget::count(self.segs.len()),
+                budget::count(n),
+                budget::count(most)
+            )),
+        }
     }
 
     /// Calls `f` with every segment that may lie within `r` of the box (x0, y0, x1, y1).
@@ -379,22 +532,34 @@ impl Cutters {
         }
         match &self.grid {
             Some(g) => g.in_box(b, r, f),
-            None => (0..self.segs.len()).for_each(f),
+            None => {
+                self.scanned.set(self.scanned.get() + self.segs.len() as u64);
+                (0..self.segs.len()).for_each(f)
+            }
         }
     }
 
-    /// Whether segment ab comes within `r` of a cut line.
-    fn near_segment(&self, a: P2, b: P2, r: f64) -> bool {
+    /// The cut line segments within `r` of segment ab, into `hits` (each once).
+    fn near_segment(&self, a: P2, b: P2, r: f64, hits: &mut Vec<usize>) {
         let bx = [a[0].min(b[0]) - r, a[1].min(b[1]) - r, a[0].max(b[0]) + r, a[1].max(b[1]) + r];
-        let mut hit = false;
+        hits.clear();
         self.visit(bx, 0.0, |k| {
             let [c, d] = self.segs[k];
-            hit = hit
-                || !(c[0].max(d[0]) < bx[0] || c[0].min(d[0]) > bx[2] || c[1].max(d[1]) < bx[1] || c[1].min(d[1]) > bx[3])
-                    && seg_seg_dist(a, b, c, d) <= r;
+            if !(c[0].max(d[0]) < bx[0] || c[0].min(d[0]) > bx[2] || c[1].max(d[1]) < bx[1] || c[1].min(d[1]) > bx[3])
+                && seg_seg_dist(a, b, c, d) <= r
+            {
+                hits.push(k);
+            }
         });
-        hit
+        // a segment in several cells is met in each
+        hits.sort_unstable();
+        hits.dedup();
     }
+}
+
+/// The most grid entries `fuel` pays for.
+fn grid_entries(fuel: &Meter) -> usize {
+    (fuel.left / GRID_BUILD_FUEL).min(MAX_GRID_ENTRIES as u64) as usize
 }
 
 /// Distance between segments ab and cd.
@@ -408,6 +573,11 @@ fn seg_seg_dist(a: P2, b: P2, c: P2, d: P2) -> f64 {
 }
 
 impl CutIndex {
+    /// Cells, segments and vertices the queries looked at so far.
+    fn seen(&self) -> u64 {
+        self.edge_grid.seen.get() + self.vertex_grid.seen.get() + self.cutters.seen()
+    }
+
     /// The target vertex nearest to `q` within `r`.
     fn nearest_vertex(&self, q: P2, r: f64) -> Option<P2> {
         let mut best: Option<(f64, usize)> = None;
@@ -494,13 +664,22 @@ impl Placer {
             owners: Vec::new(),
             ix: CutIndex {
                 bboxes: Vec::new(),
+                pairs: Vec::new(),
                 placed: RefCell::default(),
                 edges: Vec::new(),
                 edge_grid: Grid::new(&[], 0.0),
                 vertex_grid: Grid::new(&[], 0.0),
                 cutters: Cutters::new(&[]),
             },
+            moved: Cell::new(0),
+            fresh: Cell::new(0),
         }
+    }
+
+    /// About how many times the snapped tools cross target `owner`'s boundary (see
+    /// [`Placer::snap_paths`]).
+    pub fn crossings(&self, owner: usize) -> u64 {
+        self.ix.pairs.get(owner).copied().unwrap_or(0)
     }
 
     pub fn frame(&self) -> Frame {
@@ -520,10 +699,13 @@ impl Placer {
     }
 
     /// Indexes the edges of the targets (`metric`, as [`Placer::add_target`] returned them,
-    /// in the same order) within `reach` of the cut lines.
-    fn index(&self, metric: &[&Geom], cutters: Cutters, reach: f64) -> CutIndex {
+    /// in the same order) within `reach` of the cut lines, charging `fuel` as it goes.
+    fn index(&self, metric: &[&Geom], cutters: Cutters, reach: f64, fuel: &mut Meter) -> Res<CutIndex> {
         let cut = &cutters;
+        fuel.spend(metric.iter().map(|g| g.num_coords() as u64).sum::<u64>() * INDEX_FUEL_PER_VERTEX)?;
         let (mut edges, mut bboxes) = (Vec::new(), Vec::with_capacity(metric.len()));
+        let mut pairs = vec![0; metric.len()];
+        let (mut hits, mut seen) = (Vec::new(), cut.seen());
         let c = cut.bb;
         let (x0, y0, x1, y1) = (c[0] - reach, c[1] - reach, c[2] + reach, c[3] + reach);
         let boxes: Vec<[f64; 4]> = cut
@@ -547,7 +729,10 @@ impl Placer {
                     if far || i == 0 {
                         continue;
                     }
-                    self.consider(owner, cut, &boxes, reach, [p2(cs[i - 1]), p2(q)], &mut edges);
+                    pairs[owner] += self.consider(owner, cut, &boxes, reach, [p2(cs[i - 1]), p2(q)], &mut edges, &mut hits);
+                    let now = cut.seen();
+                    fuel.spend((now - seen) * GRID_VISIT_FUEL + hits.len() as u64 * PAIR_FUEL)?;
+                    seen = now;
                 }
             }
             bboxes.push(bb);
@@ -556,25 +741,42 @@ impl Placer {
         let edge_grid = Grid::new(&segs, mean_len(&segs));
         let pts: Vec<[P2; 2]> = edges.iter().flat_map(|e| [[e.m[0]; 2], [e.m[1]; 2]]).collect();
         let vertex_grid = Grid::new(&pts, mean_len(&segs));
-        CutIndex { bboxes, placed: RefCell::default(), edges, edge_grid, vertex_grid, cutters }
+        fuel.spend(edges.len() as u64 * EDGE_FUEL + (edge_grid.built + vertex_grid.built) * GRID_BUILD_FUEL)?;
+        Ok(CutIndex { bboxes, pairs, placed: RefCell::default(), edges, edge_grid, vertex_grid, cutters })
     }
 
-    /// Registers target edge ab if it comes within `reach` of a cut line. Out of line: the
-    /// scan in [`Placer::index`] runs over every target vertex and rarely gets here.
+    /// Registers target edge ab if it comes within `reach` of a cut line; returns how many
+    /// cut line segments do, which are left in `hits`. Out of line: the scan in
+    /// [`Placer::index`] runs over every target vertex and rarely gets here.
+    #[allow(clippy::too_many_arguments)]
     #[inline(never)]
-    fn consider(&self, owner: usize, cut: &Cutters, boxes: &[[f64; 4]], reach: f64, [a, b]: [P2; 2], edges: &mut Vec<Edge>) {
+    fn consider(
+        &self,
+        owner: usize,
+        cut: &Cutters,
+        boxes: &[[f64; 4]],
+        reach: f64,
+        [a, b]: [P2; 2],
+        edges: &mut Vec<Edge>,
+        hits: &mut Vec<usize>,
+    ) -> u64 {
+        hits.clear();
         if a == b {
-            return;
+            return 0;
         }
         let (ex0, ey0, ex1, ey1) = (lo(a[0], b[0]), lo(a[1], b[1]), hi(a[0], b[0]), hi(a[1], b[1]));
-        let near = match &cut.grid {
-            Some(_) => cut.near_segment(a, b, reach),
-            None => boxes.iter().zip(&cut.segs).any(|(bx, [u, v])| {
-                !(ex1 < bx[0] || ex0 > bx[2] || ey1 < bx[1] || ey0 > bx[3]) && seg_seg_dist(a, b, *u, *v) <= reach
-            }),
-        };
-        if !near {
-            return;
+        match &cut.grid {
+            Some(_) => cut.near_segment(a, b, reach, hits),
+            None => {
+                cut.scanned.set(cut.scanned.get() + cut.segs.len() as u64);
+                hits.extend(boxes.iter().zip(&cut.segs).enumerate().filter_map(|(k, (bx, [u, v]))| {
+                    (!(ex1 < bx[0] || ex0 > bx[2] || ey1 < bx[1] || ey0 > bx[3]) && seg_seg_dist(a, b, *u, *v) <= reach)
+                        .then_some(k)
+                }))
+            }
+        }
+        if hits.is_empty() {
+            return 0;
         }
         let ll = |c: P2| {
             let c = Coord { x: c[0], y: c[1] };
@@ -587,12 +789,14 @@ impl Placer {
         } else {
             Edge { m: [b, a], ll: [lb, la], dim, owner }
         });
+        hits.len() as u64
     }
 
     /// The index for cut lines (metres) that are not snapped, through targets `metric` (see
     /// [`Placer::snap_paths`]), for [`Placer::unproject_cut`].
     pub fn cut_index(&self, metric: &[&Geom], paths: &[Vec<P2>]) -> CutIndex {
-        self.index(metric, Cutters::new(paths), EDGE_TOL_M)
+        // the callers check their whole division beforehand
+        self.index(metric, Cutters::new(paths), EDGE_TOL_M, &mut Meter::unlimited()).expect("never runs out")
     }
 
     /// The snapped tool paths as target `owner` (in [`Placer::add_target`] order) is to be
@@ -600,8 +804,10 @@ impl Placer {
     /// would leave the boolean ops a zero-width sliver to round, and with every open end on
     /// its boundary carried `reach` metres on, so that the end crosses the boundary however
     /// the boolean ops round it.
-    pub fn cutters_for(&self, owner: usize, paths: &[Vec<P2>], reach: f64) -> Vec<Vec<P2>> {
+    pub fn cutters_for(&self, owner: usize, paths: &[Vec<P2>], reach: f64, fuel: &mut Meter) -> Res<Vec<Vec<P2>>> {
         let (bb, ix) = (self.ix.bboxes[owner], &self.ix);
+        let seen = ix.seen();
+        fuel.spend(paths.iter().map(|p| p.len() as u64).sum::<u64>() * INDEX_FUEL_PER_VERTEX)?;
         let r = 2.0 * EDGE_TOL_M;
         let near = |q: P2| q[0] >= bb[0] - r && q[0] <= bb[2] + r && q[1] >= bb[1] - r && q[1] <= bb[3] + r;
         let mut out = Vec::new();
@@ -634,15 +840,23 @@ impl Placer {
                 }
             }
         }
-        out
+        fuel.spend((ix.seen() - seen) * GRID_VISIT_FUEL)?;
+        Ok(out)
     }
 
     /// Snaps tool paths (metres; rings closed) to the targets (`metric`, as
     /// [`Placer::add_target`] returned them, in the same order; see the module
-    /// documentation) and registers them as the [`Cutters`] of [`Placer::unproject`].
-    pub fn snap_paths(&mut self, metric: &[&Geom], paths: &mut [Vec<P2>]) {
+    /// documentation) and registers them as the [`Cutters`] of [`Placer::unproject`],
+    /// charging `fuel` as it goes. Refuses tools with too many long segments close together
+    /// (see [`MAX_GRID_ENTRIES`]).
+    pub fn snap_paths(&mut self, metric: &[&Geom], paths: &mut [Vec<P2>], fuel: &mut Meter) -> Res<()> {
+        // the tools are indexed three times, about as large each time
+        let cutters = Cutters::within(paths, Some(grid_entries(fuel) / 3));
+        cutters.check()?;
+        fuel.spend(cutters.built_fuel())?;
         // the snapped paths stay within TOOL_SNAP_M of these
-        let mut ix = self.index(metric, Cutters::new(paths), 2.0 * TOOL_SNAP_M);
+        let mut ix = self.index(metric, cutters, 2.0 * TOOL_SNAP_M, fuel)?;
+        let mut seen = ix.seen();
         for p in paths.iter_mut() {
             for q in p.iter_mut() {
                 if let Some(v) = ix.nearest_vertex(*q, TOOL_SNAP_M) {
@@ -650,31 +864,49 @@ impl Placer {
                 } else if let Some(k) = ix.nearest_edge(*q, TOOL_SNAP_M) {
                     *q = ix.onto(k, *q);
                 }
+                let now = ix.seen();
+                fuel.spend(SNAP_FUEL_PER_VERTEX + (now - seen) * GRID_VISIT_FUEL)?;
+                seen = now;
             }
         }
-        let tool = Cutters::new(paths);
+        let tool = Cutters::within(paths, Some(grid_entries(fuel) / 2));
+        tool.check()?;
+        fuel.spend(tool.built_fuel())?;
         let r = TOOL_SNAP_M;
+        // the parameter on segment ab of a target vertex v strictly inside it, within r
+        let inside = |v: P2, a: P2, b: P2| {
+            if v[0] < a[0].min(b[0]) - r
+                || v[0] > a[0].max(b[0]) + r
+                || v[1] < a[1].min(b[1]) - r
+                || v[1] > a[1].max(b[1]) + r
+                || dist(v, a) <= r
+                || dist(v, b) <= r
+            {
+                return None;
+            }
+            let (d, t) = seg_dist(v, a, b);
+            (d <= r && t > 0.0 && t < 1.0).then_some(t)
+        };
         let mut ins: Vec<(usize, usize, f64, P2)> = Vec::new();
+        let mut seen = tool.seen();
         for e in &ix.edges {
             for v in e.m {
                 tool.visit([v[0], v[1], v[0], v[1]], r, |k| {
                     let [a, b] = tool.segs[k];
-                    if v[0] < a[0].min(b[0]) - r
-                        || v[0] > a[0].max(b[0]) + r
-                        || v[1] < a[1].min(b[1]) - r
-                        || v[1] > a[1].max(b[1]) + r
-                        || dist(v, a) <= r
-                        || dist(v, b) <= r
-                    {
-                        return;
-                    }
-                    let (d, t) = seg_dist(v, a, b);
-                    if d <= r && t > 0.0 && t < 1.0 {
-                        ins.push((tool.ids[k].0, tool.ids[k].1, t, v));
+                    let Some(t) = inside(v, a, b) else { return };
+                    ins.push((tool.ids[k].0, tool.ids[k].1, t, v));
+                    let from = tool.repeats.partition_point(|x| x.0 < k);
+                    for &(_, pi, i, rev) in tool.repeats[from..].iter().take_while(|x| x.0 == k) {
+                        let t = if rev { inside(v, b, a) } else { Some(t) };
+                        ins.extend(t.map(|t| (pi, i, t, v)));
                     }
                 });
             }
+            let now = tool.seen();
+            fuel.spend((now - seen) * GRID_VISIT_FUEL)?;
+            seen = now;
         }
+        fuel.spend(ins.len() as u64 * INSERT_SORT_FUEL)?;
         ins.sort_by(|x, y| (x.0, x.1).cmp(&(y.0, y.1)).then(x.2.total_cmp(&y.2)));
         ins.dedup_by(|y, x| (x.0, x.1, x.3) == (y.0, y.1, y.3));
         let mut it = ins.into_iter().peekable();
@@ -690,8 +922,11 @@ impl Placer {
             out.dedup();
             *p = out;
         }
-        ix.cutters = Cutters::new(paths);
+        ix.cutters = Cutters::within(paths, Some(grid_entries(fuel)));
+        ix.cutters.check()?;
+        fuel.spend(ix.cutters.built_fuel())?;
         self.ix = ix;
+        Ok(())
     }
 
     /// Metres -> lon/lat for one result position; a vertex placed on an original edge is
@@ -706,10 +941,12 @@ impl Placer {
     // out of line: `place` runs for every result vertex, almost all of them original
     #[inline(never)]
     fn place_new(&self, ix: &CutIndex, m: Coord<f64>, new: &mut Vec<NewVertex>) -> Coord<f64> {
+        self.moved.set(self.moved.get() + 1);
         if let Some(k) = ix.nearest_edge(p2(m), EDGE_TOL_M) {
             let key = (m.x.to_bits(), m.y.to_bits(), k);
             let cached = ix.placed.borrow().get(&key).copied();
             let at = cached.unwrap_or_else(|| {
+                self.fresh.set(self.fresh.get() + 1);
                 let at = inv_onto(self.frame, ix.on_edge(k, p2(m)), ix.edges[k].m);
                 ix.placed.borrow_mut().insert(key, at);
                 at
@@ -729,9 +966,28 @@ impl Placer {
     }
 
     /// A metric result back to lon/lat; the vertices placed on original edges are added to
-    /// `new`.
-    pub fn unproject(&self, metric: &Geom, new: &mut Vec<NewVertex>) -> Geom {
-        self.unproject_cut(&self.ix, metric, new)
+    /// `new`. Charges `fuel` for placing the new vertices (the original ones are part of
+    /// editing them, see [`budget::edit_fuel`] and [`budget::write_fuel`]); once it would
+    /// run out the rest is only unprojected and the command refused.
+    pub fn unproject(&self, metric: &Geom, new: &mut Vec<NewVertex>, fuel: &mut Meter) -> Res<Geom> {
+        let (ix, frame) = (&self.ix, self.frame);
+        let (seen, moved, fresh, left) = (ix.seen(), self.moved.get(), self.fresh.get(), fuel.left);
+        let work = || {
+            (ix.seen() - seen) * GRID_VISIT_FUEL
+                + (self.moved.get() - moved) * MOVED_FUEL
+                + (self.fresh.get() - fresh) * PLACE_FUEL
+        };
+        let mut out = false;
+        let g = metric.map_coords_mut(|c| {
+            if out {
+                return frame.inv_coord(c);
+            }
+            let at = self.place(ix, c, new);
+            out = work() > left;
+            at
+        });
+        fuel.spend(work())?;
+        Ok(g)
     }
 
     /// [`Placer::unproject`] for the cut lines of `ix` instead of the snapped tools.
@@ -752,16 +1008,28 @@ pub struct Scope<'a> {
     /// (layer, feature id) of the features the command writes, deletes or uses as tools:
     /// never neighbours.
     pub exclude: Vec<(i64, i64)>,
-    /// Estimated fuel the command spent reading and editing (see [`budget::edit_fuel`]).
+    /// Estimated fuel the command spends besides sharing: reading and editing (see
+    /// [`budget::edit_fuel`]), and what else it counts towards `limit`.
     pub spent: u64,
+    /// What the command may spend in all, sharing included: [`EDIT_FUEL_LIMIT`] when `spent`
+    /// only counts reading and editing.
+    pub limit: u64,
     /// A layer the command already read whole to find its targets: reading it again costs
     /// as much again.
     pub read_whole: Option<i64>,
 }
 
-/// Fuel the command may have spent, reading neighbours included, before its geometry work:
-/// what [`budget::check_edit`] allows plus a share of the rest.
-const NEIGHBOUR_FUEL_LIMIT: u64 = budget::COMMAND_FUEL * 6 / 10;
+/// Fuel a command that counts only reading and editing may spend, reading neighbours
+/// included: what [`budget::check_edit`] allows plus a share of the rest, the rest left for
+/// its geometry work.
+pub const EDIT_FUEL_LIMIT: u64 = budget::COMMAND_FUEL * 6 / 10;
+
+/// Fuel per new vertex looked at for a neighbour's segment (a few comparisons; projecting
+/// the segment when the vertex is near it).
+const VISIT_FUEL: u64 = 100;
+/// Fuel per vertex inserted into a neighbour: what an `edit.vertex` call costs the command
+/// (measured: about 3 000 of them use up a whole command).
+const INSERT_FUEL: u64 = 150_000;
 
 /// Margin of the lon/lat pre-filter, in degrees (~0.1 m): far above [`EDGE_TOL_M`].
 const LONLAT_MARGIN: f64 = 1e-6;
@@ -780,7 +1048,8 @@ struct Insert {
 #[derive(Default)]
 pub struct Shared {
     inserts: Vec<Insert>,
-    /// Names of the layers that were too large to read in the same command.
+    /// Names of the layers that were too large to read, or to search and update, in the same
+    /// command.
     pub skipped: Vec<String>,
 }
 
@@ -835,23 +1104,30 @@ pub fn note(vertices: usize, features: usize, skipped: &[String]) -> String {
     }
     for name in skipped {
         s += &format!(
-            "; shared vertices not added in '{name}': the layer is too large to read in the same command \
+            "; shared vertices not added in '{name}': the layer is too large to search in the same command \
              (select fewer features or turn off Topological editing)"
         );
     }
     s
 }
 
-/// New vertices sorted by longitude, with their edge and position in metres, to find the
-/// segments of other features they lie on. Vertices at the same position are kept once per
-/// edge and owner: two edited edges crossing at a new vertex each lead it to their own
-/// neighbours.
+/// New vertices in bands of latitude, each sorted by longitude, with their edge and position
+/// in metres, to find the segments of other features they lie on. Vertices at the same
+/// position are kept once per edge and owner: two edited edges crossing at a new vertex each
+/// lead it to their own neighbours.
 struct Lookup {
     frame: Frame,
-    /// Sorted by longitude.
+    /// By band, then by longitude.
     vs: Vec<Near>,
+    /// Vertices of band `i` are `vs[bands[i]..bands[i + 1]]`.
+    bands: Vec<usize>,
+    /// Latitude where the bands start, and their height.
+    lat0: f64,
+    band: f64,
     /// Metres per degree of longitude, for a rough distance before projecting.
     m_per_lon: f64,
+    /// Vertices looked at so far: the work a search took.
+    visits: Cell<u64>,
 }
 
 /// Metres per degree of latitude (roughly).
@@ -887,7 +1163,30 @@ impl Lookup {
         let vs: Vec<Near> =
             new.iter().map(|v| Near { m: [f(v.a), f(v.b), f(v.at)], at: v.at, dim: v.dim, owner: v.owner }).collect();
         let lat = vs.iter().map(|v| v.at.y).sum::<f64>() / vs.len().max(1) as f64;
-        Lookup { frame, vs, m_per_lon: M_PER_DEG * lat.to_radians().cos() }
+        let (lat0, lat1) = vs.iter().fold((f64::MAX, f64::MIN), |(a, b), v| (a.min(v.at.y), b.max(v.at.y)));
+        // about as many bands as vertices per band
+        let n = ((vs.len() as f64).sqrt().ceil() as usize).max(1);
+        let band = if lat1 > lat0 { (lat1 - lat0) / n as f64 } else { 1.0 };
+        let mut look = Lookup {
+            frame,
+            vs: Vec::new(),
+            bands: Vec::new(),
+            lat0,
+            band,
+            m_per_lon: M_PER_DEG * lat.to_radians().cos(),
+            visits: Cell::new(0),
+        };
+        let n = if lat1 > lat0 { n } else { 1 };
+        let mut vs = vs;
+        // stable: by longitude within a band, as sorted above
+        vs.sort_by_key(|v| look.band_of(v.at.y, n));
+        look.bands = (0..=n).map(|i| vs.partition_point(|v| look.band_of(v.at.y, n) < i)).collect();
+        look.vs = vs;
+        look
+    }
+
+    fn band_of(&self, lat: f64, n: usize) -> usize {
+        (((lat - self.lat0) / self.band).floor().max(0.0) as usize).min(n - 1)
     }
 
     /// Whether `g` may hold a vertex of its dimension not of `owner` on its boundary.
@@ -897,13 +1196,19 @@ impl Lookup {
         let (x0, y0, x1, y1) = (b.min().x - m, b.min().y - m, b.max().x + m, b.max().y + m);
         // wider than half the globe: across the antimeridian, any longitude may be on it
         let (x0, x1) = if x1 - x0 > 180.0 { (f64::NEG_INFINITY, f64::INFINITY) } else { (x0, x1) };
-        self.by_lon(x0, x1).any(|v| v.dim == dim && v.owner != owner && v.at.y >= y0 && v.at.y <= y1)
+        self.in_box(x0, x1, y0, y1).any(|v| v.dim == dim && v.owner != owner && v.at.y >= y0 && v.at.y <= y1)
     }
 
-    /// The vertices from longitude `x0` to `x1`.
-    fn by_lon(&self, x0: f64, x1: f64) -> impl Iterator<Item = &Near> {
-        let from = self.vs.partition_point(|v| v.at.x < x0);
-        self.vs[from..].iter().take_while(move |v| v.at.x <= x1)
+    /// The vertices from longitude `x0` to `x1` in the bands from latitude `y0` to `y1` (some
+    /// beyond those latitudes), counted in `visits`.
+    fn in_box(&self, x0: f64, x1: f64, y0: f64, y1: f64) -> impl Iterator<Item = &Near> {
+        let n = self.bands.len() - 1;
+        let (b0, b1) = if y0 <= y1 { (self.band_of(y0, n), self.band_of(y1, n) + 1) } else { (0, 0) };
+        (b0..b1).flat_map(move |b| {
+            let row = &self.vs[self.bands[b]..self.bands[b + 1]];
+            let from = row.partition_point(|v| v.at.x < x0);
+            row[from..].iter().take_while(move |v| v.at.x <= x1).inspect(move |_| self.visits.set(self.visits.get() + 1))
+        })
     }
 
     /// The vertices of `dim` that lie on segment cd (lon/lat) of another feature, strictly
@@ -914,9 +1219,9 @@ impl Lookup {
         let (sy0, sy1) = (c.y.min(d.y) - m, c.y.max(d.y) + m);
         // a segment across the antimeridian runs from its larger longitude east to its smaller
         let near = if sx1 - sx0 > 180.0 {
-            self.by_lon(sx1 - m, f64::INFINITY).chain(self.by_lon(f64::NEG_INFINITY, sx0 + m))
+            self.in_box(sx1 - m, f64::INFINITY, sy0, sy1).chain(self.in_box(f64::NEG_INFINITY, sx0 + m, sy0, sy1))
         } else {
-            self.by_lon(sx0 - m, sx1 + m).chain(self.by_lon(f64::INFINITY, f64::NEG_INFINITY))
+            self.in_box(sx0 - m, sx1 + m, sy0, sy1).chain(self.in_box(f64::INFINITY, f64::NEG_INFINITY, 1.0, 0.0))
         };
         let dlon = |x: f64| if x > 180.0 { x - 360.0 } else if x < -180.0 { x + 360.0 } else { x };
         let mut metric: Option<(P2, P2)> = None;
@@ -967,19 +1272,35 @@ impl Lookup {
 /// edges: a piece of one target then has the vertices the cut put on the edge it shares with
 /// another target, as the unedited neighbours get them from [`plan`].
 ///
-/// `results` are (owner, lon/lat result), owner as in [`NewVertex::owner`].
-pub fn share_within<'a>(frame: Frame, results: impl IntoIterator<Item = (usize, &'a mut Geom)>, new: &[NewVertex]) {
+/// `results` are (owner, lon/lat result), owner as in [`NewVertex::owner`]. Charges `fuel`
+/// as it goes; once it runs out the results are left half done and the command refused.
+pub fn share_within<'a>(
+    frame: Frame,
+    results: impl IntoIterator<Item = (usize, &'a mut Geom)>,
+    new: &[NewVertex],
+    fuel: &mut Meter,
+) -> Res<()> {
     if new.is_empty() {
-        return;
+        return Ok(());
     }
+    fuel.spend(new.len() as u64 * LOOKUP_FUEL)?;
     let look = Lookup::new(frame, new);
+    let fuel = RefCell::new(fuel);
     let fix = |l: &mut geo::LineString<f64>, dim: Dim, owner: usize| {
+        let mut fuel = fuel.borrow_mut();
+        if fuel.out {
+            return;
+        }
         // (segment, parameter, position)
         let mut ins: Vec<(usize, f64, Coord<f64>)> = Vec::new();
         let mut hits = Vec::new();
         for i in 1..l.0.len() {
             hits.clear();
+            let visits = look.visits.get();
             look.on_segment(dim, owner, l.0[i - 1], l.0[i], &mut hits);
+            if fuel.spend(SHARE_FUEL_PER_SEGMENT + (look.visits.get() - visits) * VISIT_FUEL).is_err() {
+                return;
+            }
             ins.extend(hits.iter().map(|&(t, at)| (i, t, at)));
         }
         if ins.is_empty() {
@@ -1014,6 +1335,8 @@ pub fn share_within<'a>(frame: Frame, results: impl IntoIterator<Item = (usize, 
             Geom::Point(_) | Geom::MultiPoint(_) => {}
         }
     }
+    let fuel = fuel.into_inner();
+    if fuel.out { Err(fuel.why.clone()) } else { Ok(()) }
 }
 
 /// Finds, for each new vertex placed on an original edge, the features that are not edited
@@ -1022,8 +1345,9 @@ pub fn share_within<'a>(frame: Frame, results: impl IntoIterator<Item = (usize, 
 /// between its end points. The vertex is to be inserted there.
 ///
 /// The host cannot read by area, so each layer is read whole: the edited layers first, then
-/// the other visible layers of the same dimension, as long as reading them fits the
-/// command's budget (a layer that does not is named in [`Shared::skipped`]).
+/// the other visible layers of the same dimension, as long as reading them, looking at the
+/// new vertices near their segments and inserting the vertices found fits the command's
+/// budget. A layer that does not fit is left as it is and named in [`Shared::skipped`].
 pub fn plan(on: bool, scope: &Scope, new: &[NewVertex]) -> Res<Shared> {
     let mut out = Shared::default();
     if !on || new.is_empty() {
@@ -1037,7 +1361,7 @@ pub fn plan(on: bool, scope: &Scope, new: &[NewVertex]) -> Res<Shared> {
 
     let edited = scope.edited.iter().filter_map(|id| scope.layers.iter().find(|l| l.id == *id));
     let others = scope.layers.iter().filter(|l| l.visible && !scope.edited.contains(&l.id));
-    let mut fuel_left = NEIGHBOUR_FUEL_LIMIT.saturating_sub(scope.spent);
+    let mut fuel_left = scope.limit.saturating_sub(scope.spent);
     let mut hits = Vec::new();
     for layer in edited.chain(others) {
         let Some(dim) = layer.dim.filter(|_| layer.is_vector()) else { continue };
@@ -1053,8 +1377,17 @@ pub fn plan(on: bool, scope: &Scope, new: &[NewVertex]) -> Res<Shared> {
             continue;
         };
         fuel_left = fuel_left.saturating_sub(bytes as u64 * per_byte);
+        if look.is_none() {
+            fuel_left = fuel_left.saturating_sub(new.len() as u64 * LOOKUP_FUEL);
+        }
         let look = look.get_or_insert_with(|| Lookup::new(frame, new));
-        for f in feats {
+        // what searching this layer and inserting its vertices takes, counted as it goes: the
+        // vertices found are inserted only when all of them fit
+        let (first, visits0) = (out.inserts.len(), look.visits.get());
+        let work = |out: &Shared| {
+            (look.visits.get() - visits0) * VISIT_FUEL + (out.inserts.len() - first) as u64 * INSERT_FUEL
+        };
+        'features: for f in feats {
             if exclude.binary_search(&(layer.id, f.id)).is_ok() {
                 continue;
             }
@@ -1075,8 +1408,19 @@ pub fn plan(on: bool, scope: &Scope, new: &[NewVertex]) -> Res<Shared> {
                         t,
                         at,
                     }));
+                    if work(&out) > fuel_left {
+                        break 'features;
+                    }
                 }
             }
+        }
+        let w = work(&out);
+        if w > fuel_left {
+            out.inserts.truncate(first);
+            out.skipped.push(layer.name.clone());
+            fuel_left = fuel_left.saturating_sub((look.visits.get() - visits0) * VISIT_FUEL);
+        } else {
+            fuel_left -= w;
         }
     }
     Ok(out)

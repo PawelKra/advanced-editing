@@ -10,7 +10,7 @@
 //! Commands without tool features (simplify, delete ring…) edit the selected features of the
 //! active layer instead, see [`active_features`].
 
-use geo::Intersects;
+use geo::{BoundingRect, CoordsIter, Coord, Intersects, MapCoordsInPlace, Rect, Translate};
 
 use crate::geojson::{Dim, Geom, bboxes_intersect};
 use crate::host_io::{self, Feature, LAYER_READ_CAP, LayerInfo, Query, Res, budget};
@@ -195,25 +195,55 @@ pub fn gather(spec: &ToolSpec) -> Res<Selection> {
 }
 
 /// Features of `layer` (all of it, capped) intersecting any of `tools`, the tools excluded.
+/// Each geometry is taken in one piece across the antimeridian (see [`in_one_piece`]) and
+/// compared with the tools also a turn east and west, so a tool at 179.95°E finds a target
+/// running from 179.9°E to 179.9°W.
 fn intersecting(layer: &LayerInfo, tools: &[Feature], properties: bool) -> Res<Vec<Feature>> {
-    let tool_geo: Vec<(geo::Rect<f64>, geo::Geometry<f64>)> =
-        tools.iter().filter_map(|t| t.geometry.as_ref()).filter_map(|g| Some((g.bbox()?, g.to_geo()))).collect();
+    let tool_geo: Vec<(Rect<f64>, geo::Geometry<f64>)> = tools
+        .iter()
+        .filter_map(|t| t.geometry.as_ref())
+        .filter_map(|g| {
+            let (bb, tg) = in_one_piece(g)?;
+            Some((bb, tg.unwrap_or_else(|| g.to_geo())))
+        })
+        .collect();
     let all = host_io::all_features_capped(layer, LAYER_READ_CAP, properties)?;
     Ok(all
         .into_iter()
         .filter(|f| !tools.iter().any(|t| t.id == f.id))
         .filter(|f| {
             let Some(g) = f.geometry.as_ref() else { return false };
-            let Some(bb) = g.bbox() else { return false };
-            let cand = tool_geo.iter().filter(|(tb, _)| bboxes_intersect(tb, &bb));
-            let mut cand = cand.peekable();
+            let Some((bb, fg)) = in_one_piece(g) else { return false };
+            let shifted = |turn: f64| Rect::new(bb.min() + (turn, 0.0).into(), bb.max() + (turn, 0.0).into());
+            let mut cand = tool_geo
+                .iter()
+                .flat_map(|(tb, tg)| TURNS.iter().filter(|&&d| bboxes_intersect(tb, &shifted(d))).map(move |&d| (d, tg)))
+                .peekable();
             if cand.peek().is_none() {
                 return false;
             }
-            let fg = g.to_geo();
-            cand.any(|(_, tg)| tg.intersects(&fg))
+            let fg = fg.unwrap_or_else(|| g.to_geo());
+            cand.any(|(d, tg)| if d == 0.0 { tg.intersects(&fg) } else { tg.intersects(&fg.translate(d, 0.0)) })
         })
         .collect())
+}
+
+/// Longitude shifts under which two geometries in one piece may meet.
+const TURNS: [f64; 3] = [0.0, 360.0, -360.0];
+
+/// The lon/lat box of `g` with its longitudes taken within 180° of its first one, so that a
+/// geometry across the antimeridian is one piece (its box may then reach beyond 180°), and
+/// that geometry when it differs from `g` (`None`: use `g` as it is).
+fn in_one_piece(g: &Geom) -> Option<(Rect<f64>, Option<geo::Geometry<f64>>)> {
+    let bb = g.bbox()?;
+    // all longitudes within 180° of each other: already in one piece
+    if bb.width() < 180.0 {
+        return Some((bb, None));
+    }
+    let mut out = g.to_geo();
+    let lon0 = out.coords_iter().next()?.x;
+    out.map_coords_in_place(|c| Coord { x: c.x + 360.0 * ((lon0 - c.x) / 360.0).round(), y: c.y });
+    Some((out.bounding_rect()?, Some(out)))
 }
 
 /// What a command without tool features needs: the features it edits.

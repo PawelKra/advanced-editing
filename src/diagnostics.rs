@@ -4,7 +4,7 @@
 use rustgis_plugin::{Map, Request, Value, json};
 
 use crate::geojson::{self, Dim};
-use crate::host_io::{self, Query, Res};
+use crate::host_io::{self, Query, Res, budget};
 use crate::proj::{Frame, FrameKind, GRS80_A, GRS80_F, SNAP_TOL_M, VertexSnap, WGS84_F};
 use crate::selection::{self, EditSpec, ToolSpec};
 
@@ -394,6 +394,42 @@ fn bench(p: &Value) -> Res<Value> {
                 let mut fuel = crate::attributes::MergeFuel::new(u64::MAX / 2);
                 crate::attributes::merge_metric_lines(parts.clone(), &mut fuel)?;
                 acc = (u64::MAX / 2 - fuel.left) as f64;
+            }
+        }
+        // Split With Line ("split") or Cut With Polygon ("cut") of the `targets` (GeoJSON
+        // geometries) by the tool `geometry`, without reading or writing, up to "stage":
+        // "snap" snapping the tool, else everything before the writes; `acc` is the fuel it
+        // was estimated to take
+        op @ ("split" | "cut") => {
+            let targets = p["targets"].as_array().ok_or("targets needed")?;
+            let targets: Vec<geojson::Geom> = targets.iter().map(geojson::from_geojson).collect::<Res<_>>()?;
+            let frame = Frame::for_geoms(targets.iter().chain([&g]))?;
+            let snap_only = p["stage"].as_str() == Some("snap");
+            for _ in 0..reps {
+                let mut fuel = budget::Meter::unlimited();
+                let mut pl = crate::topo::Placer::new(frame);
+                let metric: Vec<geojson::Geom> = targets.iter().map(|t| pl.add_target(t)).collect();
+                let metric: Vec<&geojson::Geom> = metric.iter().collect();
+                let tool = pl.add_tool(&g);
+                if op == "split" {
+                    let mut paths = crate::lines::paths_of(&tool);
+                    if snap_only {
+                        pl.snap_paths(&metric, &mut paths, &mut fuel)?;
+                    } else {
+                        crate::lines::split_pieces(&mut pl, &metric, paths, &mut fuel)?;
+                    }
+                } else if snap_only {
+                    crate::polygons::snap_tool_polygons(&mut pl, &metric, crate::polygons::polygons_of(&tool).0, &mut fuel)?;
+                } else {
+                    let results = crate::polygons::cut_results(&mut pl, &metric, crate::polygons::polygons_of(&tool).0, false, &mut fuel)?;
+                    let mut new = Vec::new();
+                    let mut out = Vec::new();
+                    for (owner, (_, r)) in results.into_iter().enumerate() {
+                        out.push((owner, pl.unproject(&geojson::Geom::MultiPolygon(r), &mut new, &mut fuel)?));
+                    }
+                    crate::topo::share_within(frame, out.iter_mut().map(|(o, g)| (*o, g)), &new, &mut fuel)?;
+                }
+                acc = (u64::MAX / 4 - fuel.left) as f64;
             }
         }
         other => return Err(format!("unknown bench op '{other}'")),

@@ -8,7 +8,7 @@ import os
 from aelib import PREFIX, CommandError, Session, Skip, check, command_ids, feature, tmpdir, write_layer
 from test_division import area_ell, tol
 from test_edge_lines import (HOLE, O, SQ, L, Problems, T, actionable, check_partition, cw, faces_of, fingerprint,
-                             flat, gmap, metric, nparts, run_two_layers, shapely_job, short, sq)
+                             flat, gmap, metric, mpoly, nparts, run_two_layers, shapely_job, short, sq)
 
 
 # ---------- merge / exchange ----------
@@ -442,6 +442,57 @@ def test_simplify_self_touching_after_removal():
     inlet = T([(0, 0), (100, 0), (100, 100), (52, 100), (52, 3), (50, 1), (48, 3), (48, 100), (0, 100)])
     edit_one(P, 'simplify: narrow inlet', 'simplify', inlet, {'tolerance': 3})
     edit_one(P, 'smooth: narrow inlet', 'smooth', inlet, {'iterations': 3})
+    P.done()
+
+
+def generalize_one(command, geom, params):
+    """Runs command on one feature; returns its result and the geometry before and after."""
+    with Session(write_layer('ed', [feature(geom, name='e')])) as s:
+        before = s.features('ed')
+        s.activate('ed')
+        s.select('ed', [0])
+        r = s.plugin(command, params)
+        return r, before[0]['geometry'], s.features('ed')[0]['geometry']
+
+
+def test_simplify_keeps_parts_and_holes_apart():
+    """Straightening a shallow notch must not swallow a part or hole lying inside it."""
+    P = Problems()
+    notched = [(0, 0), (100, 0), (100, 100), (55, 100), (55, 97), (45, 97), (45, 100), (0, 100)]
+    # starts mid-ring so that Douglas-Peucker keeps a triangle of it
+    island = [(50, 98), (54, 98), (54, 99.5), (46, 99.5), (46, 98)]
+    for label, geom in [
+        ('simplify: part in a notch', mpoly(O, [notched], [island])),
+        # the hole's notch (polygon material reaching into it) holds a second hole
+        ('simplify: hole in a hole notch',
+         T([(-20, -20), (120, -20), (120, 120), (-20, 120)], cw(notched), island[:1] + cw(island[1:]))),
+    ]:
+        rep = shapely_job(geoms=[gmap(geom, metric(geom))])
+        P.expect(label, rep['valid'][0], 'the input is invalid: %s' % rep['why'][0])
+        r, before, after = generalize_one('simplify', geom, {'tolerance': 4})
+        P.expect(label, r['invalid'] == 1 and r['changed'] == 0, r)
+        P.expect(label, after == before, 'an invalid result was written')
+        # a tolerance below the notch depth keeps the notch and edits nothing
+        r, before, after = generalize_one('simplify', geom, {'tolerance': 2})
+        P.expect(label, r['invalid'] == 0, r)
+    P.done()
+
+
+def test_simplify_keeps_valid_nesting():
+    """An island inside another part's hole is valid and gets simplified."""
+    P = Problems()
+    shell = [(0, 0), (50, 0.1), (100, 0), (100, 100), (0, 100)]
+    hole = cw(sq(20, 20, 60))
+    for label, geom in [
+        ('simplify: island in a hole', mpoly(O, [shell, hole], [[(30, 30), (60, 30.1), (70, 30), (70, 70), (30, 70)]])),
+        ('simplify: two holes side by side', T(shell, cw(sq(10, 10, 30)), cw([(50, 10), (70, 10.1), (90, 10), (90, 40), (50, 40)]))),
+    ]:
+        r, _, after = generalize_one('simplify', geom, {'tolerance': 0.5})
+        P.expect(label, r['changed'] == 1 and r['invalid'] == 0, r)
+        rep = shapely_job(geoms=[gmap(after, metric(after))])
+        P.expect(label, rep['valid'][0], 'invalid result: %s' % rep['why'][0])
+    r, _, after = generalize_one('smooth', mpoly(O, [shell, hole], [sq(30, 30, 40)]), {'iterations': 2})
+    P.expect('smooth: island in a hole', r['changed'] == 1 and r['invalid'] == 0, r)
     P.done()
 
 

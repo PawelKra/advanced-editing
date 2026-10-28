@@ -57,18 +57,31 @@ fn whole_parts(name: &str, x: f64, max: usize) -> Res<usize> {
 /// an upper bound fitted to `diag-bench` runs on wavy and comb-shaped rings of 20 to 9000
 /// vertices cut into 2 to 50 parts. Cuts through a ring that zigzags across them cost the
 /// most, hence the large `v * p` term. Measuring the parts on the ellipsoid (an inverse
-/// projection per edge) takes about 4500 per vertex of it.
-fn divide_fuel(v: usize, p: usize) -> u64 {
+/// projection per edge) takes about 4500 per vertex of it; `pieces` are the further pieces
+/// long edges are measured in ([`Parcel::authalic_pieces`]).
+fn divide_fuel(v: usize, p: usize, pieces: f64) -> u64 {
     let (v, p) = (v as u64, p as u64);
-    29_000 * v + 4_500 * v * p + 325_000 * p
+    29_000 * v + 4_500 * v * p + 325_000 * p + (AUTHALIC_PIECE_FUEL * pieces).ceil() as u64
 }
 
-/// Refuses dividing `parcels` (vertices, parts) when reading them, dividing them and writing
-/// the parts would not fit in `fuel`. Each cut adds about two vertices to each side.
-fn check_division(parcels: &[(usize, usize)], fuel: u64, too_much: impl Fn(usize, usize, usize) -> String) -> Res<()> {
-    let vertices: usize = parcels.iter().map(|&(v, _)| v).sum();
-    let parts: usize = parcels.iter().map(|&(_, p)| p).sum();
-    let compute: u64 = parcels.iter().map(|&(v, p)| divide_fuel(v, p)).sum();
+/// Fuel per piece of an edge measured by [`Authalic`] (two inverse projections and two
+/// authalic latitudes): `diag-bench` measures 4400 near the equator, 6700 at 45° and 13 000
+/// above 57°, where the projection's cosine needs libm.
+const AUTHALIC_PIECE_FUEL: f64 = 14_000.0;
+
+/// A parcel to check: its vertices, parts and the further pieces its edges are measured in.
+struct Load {
+    vertices: usize,
+    parts: usize,
+    pieces: f64,
+}
+
+/// Refuses dividing `parcels` when reading them, dividing them and writing the parts would
+/// not fit in `fuel`. Each cut adds about two vertices to each side.
+fn check_division(parcels: &[Load], fuel: u64, too_much: impl Fn(usize, usize, usize) -> String) -> Res<()> {
+    let vertices: usize = parcels.iter().map(|l| l.vertices).sum();
+    let parts: usize = parcels.iter().map(|l| l.parts).sum();
+    let compute: u64 = parcels.iter().map(|l| divide_fuel(l.vertices, l.parts, l.pieces)).sum();
     let need = budget::edit_fuel(parcels.len(), vertices) + compute + budget::edit_fuel(parts, vertices + 4 * parts);
     if need <= fuel { Ok(()) } else { Err(too_much(parcels.len(), vertices, parts)) }
 }
@@ -717,6 +730,25 @@ impl Parcel {
         p.clamp(2, MAX_PARTS)
     }
 
+    /// How many pieces beyond one per edge [`Authalic`] measures `parts` parts cut at `n` in
+    /// (an upper bound): the parcel's edges fall into pieces of [`AUTHALIC_PIECE_M`], and each
+    /// cut is an edge of the parts on both sides, inside the parcel for at most the parcel's
+    /// extent along the cut. Planar parts are not measured so.
+    fn authalic_pieces(&self, n: P2, parts: usize) -> f64 {
+        if self.mode == AreaMode::Planar {
+            return 0.0;
+        }
+        let mut perimeter = 0.0;
+        for (r, _) in &self.rings {
+            for (i, a) in r.iter().enumerate() {
+                let b = r[(i + 1) % r.len()];
+                perimeter += ((b.x - a.x).powi(2) + (b.y - a.y).powi(2)).sqrt();
+            }
+        }
+        let (lo, hi) = self.extent([-n[1], n[0]]);
+        (perimeter + 2.0 * parts.saturating_sub(1) as f64 * (hi - lo)) / AUTHALIC_PIECE_M
+    }
+
     fn centroid(&self) -> Coord<f64> {
         let mut m = Moments::default();
         for (r, w) in &self.rings {
@@ -828,20 +860,33 @@ fn divide_selected(ctx: &Ctx, plan: Plan, keep_last: bool) -> Res<(Vec<(i64, Vec
         Plan::Equal(k) => k,
         _ => 2,
     };
-    let parcels: Vec<(usize, usize)> =
-        ed.features.iter().map(|f| (f.geometry.as_ref().map_or(0, Geom::num_coords), parts)).collect();
-    check_division(&parcels, budget::COMMAND_FUEL, |n, v, _| {
+    let too_much = |n: usize, v: usize, _: usize| {
         format!(
             "Dividing {n} polygon(s) with {} vertices into {parts} parts is more than one command can do. \
              Select fewer polygons, or use the Divide Parcel tool (it handles whole layers).",
             budget::count(v)
         )
-    })?;
+    };
+    let vertices = |f: &host_io::Feature| f.geometry.as_ref().map_or(0, Geom::num_coords);
+    // by the vertices first, so that preparing the parcels fits; then with their edges' lengths
+    let loads: Vec<Load> = ed.features.iter().map(|f| Load { vertices: vertices(f), parts, pieces: 0.0 }).collect();
+    check_division(&loads, budget::COMMAND_FUEL, too_much)?;
     let n = sweep_normal(ctx.settings.angle_deg, ctx.settings.reverse);
-    let mut done = Vec::with_capacity(ed.features.len());
+    let mut parcels = Vec::with_capacity(ed.features.len());
     for f in &ed.features {
         let fail = |e: String| format!("{USAGE}. (feature {}: {e})", f.id);
-        let parcel = Parcel::new(f.geom()?, AreaMode::Ellipsoidal).map_err(fail)?;
+        parcels.push(Parcel::new(f.geom()?, AreaMode::Ellipsoidal).map_err(fail)?);
+    }
+    let loads: Vec<Load> = ed
+        .features
+        .iter()
+        .zip(&parcels)
+        .map(|(f, p)| Load { vertices: vertices(f), parts, pieces: p.authalic_pieces(n, parts) })
+        .collect();
+    check_division(&loads, budget::COMMAND_FUEL, too_much)?;
+    let mut done = Vec::with_capacity(ed.features.len());
+    for (f, parcel) in ed.features.iter().zip(&parcels) {
+        let fail = |e: String| format!("{USAGE}. (feature {}: {e})", f.id);
         let parts = parcel.divide(n, plan).map_err(fail)?;
         if parts.len() < 2 {
             return Err(fail("the cut misses it".into()));
@@ -856,12 +901,14 @@ fn divide_selected(ctx: &Ctx, plan: Plan, keep_last: bool) -> Res<(Vec<(i64, Vec
         .flat_map(|(i, (_, ps))| ps.iter().flat_map(move |p| p.new_vertices.iter().map(move |v| NewVertex { owner: i, ..*v })))
         .collect();
     let results = done.iter_mut().enumerate().flat_map(|(i, (_, ps))| ps.iter_mut().map(move |p| (i, &mut p.geom)));
-    topo::share_within(ed.frame()?, results, &new_vertices);
+    // the division was checked as a whole beforehand
+    topo::share_within(ed.frame()?, results, &new_vertices, &mut budget::Meter::unlimited())?;
     let scope = topo::Scope {
         layers: &ed.layers,
         edited: vec![layer],
         exclude: done.iter().map(|(f, _)| (layer, f.id)).collect(),
         spent: budget::edit_fuel(ed.features.len(), budget::vertices(&ed.features)),
+        limit: topo::EDIT_FUEL_LIMIT,
         read_whole: None,
     };
     let shared = topo::plan(ctx.settings.topological, &scope, &new_vertices)?;
@@ -1005,8 +1052,14 @@ pub fn divide_parcel_tool(req: &Request) -> Res<Value> {
             Ok((Parcel::new(&g, mode)?, g.num_coords()))
         })
         .collect();
-    let parcels: Vec<(usize, usize)> =
-        prepared.iter().flatten().map(|(p, v)| (*v, p.parts_estimate(n, plan))).collect();
+    let parcels: Vec<Load> = prepared
+        .iter()
+        .flatten()
+        .map(|(p, v)| {
+            let parts = p.parts_estimate(n, plan);
+            Load { vertices: *v, parts, pieces: p.authalic_pieces(n, parts) }
+        })
+        .collect();
     check_division(&parcels, budget::TOOL_FUEL, |count, v, parts| {
         format!(
             "Dividing {count} polygon(s) with {} vertices into about {} parts is more than one run of the tool can do. \

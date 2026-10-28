@@ -10,12 +10,21 @@
 //! Boolean ops run in metres through a [`VertexSnap`], so untouched vertices are written back
 //! bit-exact. Ring and part commands that only regroup existing rings never project at all.
 
-use geo::{Area, BooleanOps, BoundingRect, Buffer, Intersects, LineString, MultiPolygon, Polygon, Rect, unary_union};
+use std::collections::HashMap;
+
+use geo::{
+    Area, BooleanOps, BoundingRect, Buffer, Intersects, LineString, MultiPolygon, Polygon, Rect, Winding, unary_union,
+};
+use i_overlay::core::fill_rule::FillRule;
+use i_overlay::core::overlay_rule::OverlayRule;
+use i_overlay::core::solver::Solver;
+use i_overlay::float::overlay::{FloatOverlay, OverlayOptions};
 use rustgis_plugin::{Map, Value, json};
 
 use crate::Ctx;
-use crate::geojson::{self, Dim, Geom, bboxes_intersect, from_polygons, prepare_output};
-use crate::host_io::{self, Feature, LAYER_READ_CAP, LayerInfo, Res, budget};
+use crate::geojson::{self, Dim, Geom, P2, bboxes_intersect, contours, from_polygons, prepare_output, shape_to_polygon};
+use crate::host_io::budget::{self, Meter};
+use crate::host_io::{self, Feature, LAYER_READ_CAP, LayerInfo, Res};
 use crate::proj::{SNAP_TOL_M, VertexSnap};
 use crate::selection::{self, EditSpec, ToolSpec};
 use crate::topo;
@@ -52,6 +61,139 @@ const FILL_GAP_USAGE: &str = "Select the polygons around the gaps in the active 
 
 const POLY: &[Dim] = &[Dim::Polygon];
 
+/// What Cut and Clip may spend in all, reading and writing included; the rest is left for the
+/// host calls and the message. The estimates are upper bounds: editing by about 15 %, the
+/// boolean ops by 10 to 30 %.
+pub const CUT_WORK_FUEL: u64 = budget::COMMAND_FUEL * 95 / 100;
+
+/// Fuel per i_overlay boolean op or slice (setting it up and turning the result into
+/// polygons), per segment it sweeps, per pair of segments it compares and per crossing it
+/// resolves (into a piece of its own, for a slice): upper bounds fitted to `diag-bench` runs
+/// on parcels, combs, zigzags and splits into thousands of pieces.
+const OVERLAY_FUEL_PER_OP: u64 = 500_000;
+const OVERLAY_FUEL_PER_SEGMENT: u64 = 9_000;
+/// The tree i_overlay sweeps many segments with when their x ranges overlap a lot.
+const OVERLAY_FUEL_PER_TREE_SEGMENT: u64 = 17_000;
+/// What a slice (Split With Line) takes per segment on top: it builds its pieces from a graph
+/// of the segments.
+const SLICE_FUEL_PER_SEGMENT: u64 = 7_000;
+const OVERLAY_FUEL_PER_PAIR: u64 = 120;
+const OVERLAY_FUEL_PER_CROSSING: u64 = 50_000;
+
+/// Estimated fuel of a boolean op or slice of `segments` segments in all, `pairs` of them
+/// side by side (see [`XRanges`]), that cross about `crossings` times.
+pub fn overlay_fuel(segments: usize, pairs: u64, crossings: u64) -> u64 {
+    let per_segment = if is_list(segments, pairs) { OVERLAY_FUEL_PER_SEGMENT } else { OVERLAY_FUEL_PER_TREE_SEGMENT };
+    OVERLAY_FUEL_PER_OP
+        + segments as u64 * per_segment
+        + pairs * OVERLAY_FUEL_PER_PAIR
+        + crossings * OVERLAY_FUEL_PER_CROSSING
+}
+
+/// Estimated fuel of a slice of `segments` segments (see [`overlay_fuel`]).
+pub fn slice_fuel(segments: usize, pairs: u64, crossings: u64) -> u64 {
+    let per_segment = if is_list(segments, pairs) { SLICE_FUEL_PER_SEGMENT } else { 2 * SLICE_FUEL_PER_SEGMENT };
+    overlay_fuel(segments, pairs, crossings) + segments as u64 * per_segment
+}
+
+/// Up to this many overlapping x ranges per segment i_overlay's list sweep beats its tree,
+/// however many segments there are: on parcels the tree, which it picks from 4000 segments
+/// on, takes nearly twice the fuel per segment.
+const LIST_PAIRS_PER_SEGMENT: u64 = 16;
+
+/// The i_overlay solver for `segments` segments with `pairs` overlapping x ranges.
+pub fn solver_for(segments: usize, pairs: u64) -> Solver {
+    if pairs <= LIST_PAIRS_PER_SEGMENT * segments as u64 { Solver::LIST } else { Solver::AUTO }
+}
+
+/// Whether i_overlay sweeps them with its list (see [`solver_for`]; [`Solver::AUTO`] does up to
+/// 4000 segments).
+fn is_list(segments: usize, pairs: u64) -> bool {
+    pairs <= LIST_PAIRS_PER_SEGMENT * segments as u64 || segments < 4000
+}
+
+/// `a` combined with `b` by `rule` as geo's [`BooleanOps`] does it (even-odd, OGC output),
+/// with `solver`.
+fn boolean(a: &MultiPolygon<f64>, b: &MultiPolygon<f64>, rule: OverlayRule, solver: Solver) -> MultiPolygon<f64> {
+    let paths = |m: &MultiPolygon<f64>| m.0.iter().flat_map(contours).collect::<Vec<Vec<P2>>>();
+    let shapes = FloatOverlay::with_subj_and_clip_custom(&paths(a), &paths(b), OverlayOptions::ogc(), solver)
+        .overlay(rule, FillRule::EvenOdd);
+    MultiPolygon(shapes.iter().map(|s| shape_to_polygon(s)).collect())
+}
+
+/// The union of `ps` as geo's [`unary_union`] does it (filled by the winding of the first
+/// ring that has one, OGC output), with `solver`.
+fn union_of(ps: &[Polygon<f64>], solver: Solver) -> MultiPolygon<f64> {
+    let rings = || ps.iter().flat_map(|p| std::iter::once(p.exterior()).chain(p.interiors()));
+    let fill = match rings().find_map(|r| r.winding_order()) {
+        Some(geo::winding_order::WindingOrder::CounterClockwise) => FillRule::Positive,
+        _ => FillRule::Negative,
+    };
+    let paths: Vec<Vec<P2>> = ps.iter().flat_map(contours).collect();
+    let shapes = FloatOverlay::with_subj_custom(&paths, OverlayOptions::ogc(), solver).overlay(OverlayRule::Subject, fill);
+    MultiPolygon(shapes.iter().map(|s| shape_to_polygon(s)).collect())
+}
+
+/// The x ranges of a set of segments. Below some thousands of segments i_overlay sweeps them
+/// with a list, comparing every two whose x ranges overlap: few for parcels, all of them for
+/// a comb's teeth.
+pub struct XRanges {
+    ranges: Vec<(f64, f64)>,
+    /// The starts and the ends, sorted.
+    lo: Vec<f64>,
+    hi: Vec<f64>,
+    /// Pairs of them that overlap.
+    pub pairs: u64,
+}
+
+impl XRanges {
+    pub fn new<'a>(paths: impl IntoIterator<Item = &'a [geojson::P2]>) -> XRanges {
+        // i_overlay merges repeated segments (either way round) before sweeping
+        let mut segs: Vec<[u64; 4]> = paths
+            .into_iter()
+            .flat_map(|p| p.windows(2))
+            .map(|w| {
+                let [a, b] = if (w[0][0], w[0][1]) <= (w[1][0], w[1][1]) { [w[0], w[1]] } else { [w[1], w[0]] };
+                [a[0].to_bits(), a[1].to_bits(), b[0].to_bits(), b[1].to_bits()]
+            })
+            .collect();
+        segs.sort_unstable();
+        segs.dedup();
+        let ranges: Vec<(f64, f64)> = segs.iter().map(|s| (f64::from_bits(s[0]), f64::from_bits(s[2]))).collect();
+        let mut lo: Vec<f64> = ranges.iter().map(|r| r.0).collect();
+        let mut hi: Vec<f64> = ranges.iter().map(|r| r.1).collect();
+        lo.sort_unstable_by(f64::total_cmp);
+        hi.sort_unstable_by(f64::total_cmp);
+        let mut x = XRanges { ranges, lo, hi, pairs: 0 };
+        // each pair twice, and every range with itself
+        x.pairs = (x.with(&x) - x.len() as u64) / 2;
+        x
+    }
+
+    /// The rings of polygons.
+    pub fn of_polygons(ps: &[Polygon<f64>]) -> XRanges {
+        let rings: Vec<Vec<geojson::P2>> =
+            ps.iter().flat_map(|p| std::iter::once(p.exterior()).chain(p.interiors())).map(geojson::ring_points).collect();
+        XRanges::new(rings.iter().map(|r| &r[..]))
+    }
+
+    pub fn len(&self) -> usize {
+        self.ranges.len()
+    }
+
+    /// Estimated fuel to build it: sorting and counting.
+    pub fn fuel(&self) -> u64 {
+        self.len() as u64 * 1_500
+    }
+
+    /// Pairs of a range here and one of `other` that overlap.
+    pub fn with(&self, other: &XRanges) -> u64 {
+        // those of `other` starting by b, less those ending before a
+        let meeting = |a: f64, b: f64| other.lo.partition_point(|x| *x <= b) - other.hi.partition_point(|x| *x < a);
+        self.ranges.iter().map(|&(a, b)| meeting(a, b) as u64).sum()
+    }
+}
+
 /// Removes the tool polygons' area from the target polygons.
 pub fn cut_with_polygon(ctx: &Ctx) -> Res<Value> {
     cut_or_clip(ctx, false)
@@ -78,26 +220,27 @@ fn cut_or_clip(ctx: &Ctx, clip: bool) -> Res<Value> {
     for t in &sel.tools {
         tool_parts.extend(polygons_of(&pl.add_tool(t.geom()?)).0);
     }
+    let read = budget::edit_fuel(
+        sel.target_count(),
+        budget::vertices(&sel.tools) + sel.targets.iter().map(|t| budget::vertices(&t.features)).sum::<usize>(),
+    );
+    let mut fuel = Meter::new(
+        CUT_WORK_FUEL.saturating_sub(read),
+        format!(
+            "{} the targets with these polygons is more than one command can do. Select fewer targets or tool \
+             polygons, or simplify them, and repeat the command for the rest.",
+            if clip { "Clipping" } else { "Cutting" }
+        ),
+    );
     let metric: Vec<&Geom> = targets.iter().map(|t| &t.2).collect();
-    let tool_parts = snap_tool_polygons(&mut pl, &metric, tool_parts);
-    let tools = unary_union(tool_parts.iter());
-    let tool_bb = tools.bounding_rect();
+    let results = cut_results(&mut pl, &metric, tool_parts, clip, &mut fuel)?;
 
     let mut plan = Plan::default();
     let mut new_vertices = Vec::new();
     let mut edited = Vec::new();
     let (mut changed, mut deleted, mut unchanged) = (0, 0, 0);
-    let mut owners = Vec::new();
-    for (owner, (layer, f, g)) in targets.iter().enumerate() {
-        let mp = &polygons_of(g);
-        let a0 = mp.unsigned_area();
-        let overlaps = matches!((tool_bb, mp.bounding_rect()), (Some(a), Some(b)) if bboxes_intersect(&a, &b));
-        let result = match (overlaps, clip) {
-            (false, false) => mp.clone(),
-            (false, true) => MultiPolygon(vec![]),
-            (true, false) => drop_slivers(mp.difference(&tools)),
-            (true, true) => drop_slivers(mp.intersection(&tools)),
-        };
+    let (mut owners, mut kept_vertices) = (Vec::new(), 0);
+    for (owner, ((layer, f, g), (a0, result))) in targets.iter().zip(results).enumerate() {
         let a1 = result.unsigned_area();
         let overlap = if clip { a1 } else { a0 - a1 };
         // in the active layer the targets are found by touching; a neighbour that only
@@ -113,7 +256,8 @@ fn cut_or_clip(ctx: &Ctx, clip: bool) -> Res<Value> {
             edited.push((layer.id, f.id));
         } else {
             changed += 1;
-            let g = pl.unproject(&Geom::MultiPolygon(result), &mut new_vertices);
+            kept_vertices += g.num_coords();
+            let g = pl.unproject(&Geom::MultiPolygon(result), &mut new_vertices, &mut fuel)?;
             plan.set.push((layer.id, f.row, prepare_output(g)?));
             owners.push(owner);
             edited.push((layer.id, f.id));
@@ -127,16 +271,19 @@ fn cut_or_clip(ctx: &Ctx, clip: bool) -> Res<Value> {
         };
         return Err(format!("{usage}. ({why})"));
     }
-    topo::share_within(pl.frame(), owners.into_iter().zip(plan.set.iter_mut().map(|s| &mut s.2)), &new_vertices);
+    let results = owners.into_iter().zip(plan.set.iter_mut().map(|s| &mut s.2));
+    topo::share_within(pl.frame(), results, &new_vertices, &mut fuel)?;
+    // the vertices the targets had are written as part of editing them
+    let vertices: usize = plan.set.iter().map(|s| s.2.num_coords()).sum();
+    fuel.spend(budget::write_fuel(0, vertices.saturating_sub(kept_vertices)))?;
     edited.extend(sel.tools.iter().map(|t| (sel.active.id, t.id)));
     let scope = topo::Scope {
         layers: &sel.layers,
         edited: sel.targets.iter().map(|t| t.layer.id).collect(),
         exclude: edited,
-        spent: budget::edit_fuel(
-            sel.target_count(),
-            budget::vertices(&sel.tools) + sel.targets.iter().map(|t| budget::vertices(&t.features)).sum::<usize>(),
-        ),
+        // the results were computed and their writes charged
+        spent: read + fuel.spent,
+        limit: CUT_WORK_FUEL,
         read_whole: sel.targets_from_active.then_some(sel.active.id),
     };
     let shared = topo::plan(ctx.settings.topological, &scope, &new_vertices)?;
@@ -163,25 +310,69 @@ fn cut_or_clip(ctx: &Ctx, clip: bool) -> Res<Value> {
     )
 }
 
+/// Each target's (`metric`, registered with `pl` in this order) area and what is left of it
+/// cut (or clipped) by the tool polygons (metres, registered with `pl` too), in metres:
+/// the target itself where the tools' box misses it. Charges `fuel` for snapping the tools
+/// and the boolean ops.
+pub fn cut_results(
+    pl: &mut topo::Placer,
+    metric: &[&Geom],
+    tool_parts: Vec<Polygon<f64>>,
+    clip: bool,
+    fuel: &mut Meter,
+) -> Res<Vec<(f64, MultiPolygon<f64>)>> {
+    let tool_parts = snap_tool_polygons(pl, metric, tool_parts, fuel)?;
+    let parts = XRanges::of_polygons(&tool_parts);
+    fuel.spend(parts.fuel() + overlay_fuel(parts.len(), parts.pairs, 0))?;
+    let tools = union_of(&tool_parts, solver_for(parts.len(), parts.pairs));
+    let tool_bb = tools.bounding_rect();
+    let tx = XRanges::of_polygons(&tools.0);
+    fuel.spend(tx.fuel())?;
+    let mut out = Vec::with_capacity(metric.len());
+    for (owner, g) in metric.iter().enumerate() {
+        let mp = polygons_of(g);
+        let a0 = mp.unsigned_area();
+        let overlaps = matches!((tool_bb, mp.bounding_rect()), (Some(a), Some(b)) if bboxes_intersect(&a, &b));
+        let result = match (overlaps, clip) {
+            (false, false) => mp,
+            (false, true) => MultiPolygon(vec![]),
+            (true, _) => {
+                let gx = XRanges::of_polygons(&mp.0);
+                let (segments, pairs) = (gx.len() + tx.len(), gx.pairs + tx.pairs + gx.with(&tx));
+                fuel.spend(gx.fuel() + overlay_fuel(segments, pairs, pl.crossings(owner)))?;
+                let rule = if clip { OverlayRule::Intersect } else { OverlayRule::Difference };
+                drop_slivers(boolean(&mp, &tools, rule, solver_for(segments, pairs)))
+            }
+        };
+        out.push((a0, result));
+    }
+    Ok(out)
+}
+
 /// The tool polygons (metres) snapped to the targets (see [`topo`]), so that a tool edge
 /// digitised on a target's edge cuts along it and leaves no sliver.
-fn snap_tool_polygons(pl: &mut topo::Placer, targets: &[&Geom], tools: Vec<Polygon<f64>>) -> Vec<Polygon<f64>> {
+pub(crate) fn snap_tool_polygons(
+    pl: &mut topo::Placer,
+    targets: &[&Geom],
+    tools: Vec<Polygon<f64>>,
+    fuel: &mut Meter,
+) -> Res<Vec<Polygon<f64>>> {
     let mut rings: Vec<Vec<geojson::P2>> = Vec::new();
     let mut shape = Vec::new();
     for p in &tools {
         shape.push(1 + p.interiors().len());
         rings.extend(std::iter::once(p.exterior()).chain(p.interiors()).map(geojson::ring_points));
     }
-    pl.snap_paths(targets, &mut rings);
+    pl.snap_paths(targets, &mut rings, fuel)?;
     let mut it = rings.into_iter().map(|r| geojson::line_from_points(&r));
-    shape
+    Ok(shape
         .into_iter()
         .filter_map(|n| {
             let ext = it.next()?;
             let holes: Vec<LineString<f64>> = it.by_ref().take(n - 1).collect();
             (ext.0.len() >= 4).then(|| Polygon::new(ext, holes.into_iter().filter(|h| h.0.len() >= 4).collect()))
         })
-        .collect()
+        .collect())
 }
 
 /// Adds the tool polygons as holes in the target polygons.
@@ -323,7 +514,9 @@ pub fn delete_ring(ctx: &Ctx) -> Res<Value> {
 
 /// Fills holes of the selected polygons with new features carrying the parent's attributes.
 /// Islands lying in a hole (other parts of the feature, other polygons of the layer) stay out
-/// of the new polygon. When the layer is too large to read, only the selected features are
+/// of the new polygon, their own holes not: each hole filled by the command is filled once,
+/// so an island's hole that gets its own fill stays out of the fill around the island, and
+/// one that doesn't belongs to it. When the layer is too large to read, only the selected features are
 /// checked for islands and the message says so: the fill may then overlap other polygons.
 pub fn fill_ring(ctx: &Ctx) -> Res<Value> {
     let spec = EditSpec {
@@ -349,6 +542,13 @@ pub fn fill_ring(ctx: &Ctx) -> Res<Value> {
     let others = layer_islands(&ed, &boxes)?;
     let layer_checked = others.is_some();
     let others = others.unwrap_or_else(|| islands_in(&ed.features, &boxes));
+    // holes filled by this command, by (feature id, ring): an island's hole among them is
+    // part of the island for the fill around it
+    let mut filled: HashMap<(i64, [u64; 2]), Vec<&LineString<f64>>> = HashMap::new();
+    for &(i, _, h) in &holes {
+        filled.entry((ed.features[i].id, ring_key(h))).or_default().push(h);
+    }
+    let is_filled = |id: i64, r: &LineString<f64>| filled.get(&(id, ring_key(r))).is_some_and(|v| v.contains(&r));
     let frame = ed.frame()?;
     let mut snap = VertexSnap::new(frame, SNAP_TOL_M);
     let mut plan = Plan::default();
@@ -356,17 +556,19 @@ pub fn fill_ring(ctx: &Ctx) -> Res<Value> {
     for &(i, k, h) in &holes {
         let ring = ccw(h);
         let Some(hb) = ring.bounding_rect() else { continue };
-        let own = parts[i].iter().enumerate().filter(|(j, _)| *j != k).map(|(_, p)| p.exterior());
-        let theirs = others.iter().filter(|o| o.0 != ed.features[i].id).map(|o| &o.1);
+        let id = ed.features[i].id;
+        let own = parts[i].iter().enumerate().filter(|(j, _)| *j != k).map(|(_, p)| (id, p));
+        let theirs = others.iter().filter(|o| o.0 != id).map(|o| (o.0, &o.1));
         let hole = Polygon::new(ring, vec![]);
         let hm = frame.project_geo(&hole);
         let mut inside = Vec::new();
-        for r in own.chain(theirs).filter(|r| r.bounding_rect().is_some_and(|b| within(&b, &hb))) {
-            let island = Polygon::new(r.clone(), vec![]);
-            let im = frame.project_geo(&island);
-            if im.unsigned_area() > AREA_EPS_M2 && im.difference(&hm).unsigned_area() <= AREA_EPS_M2 {
-                snap.add(&Geom::Polygon(island));
-                inside.push(im);
+        for (oid, p) in own.chain(theirs).filter(|(_, p)| p.exterior().bounding_rect().is_some_and(|b| within(&b, &hb))) {
+            let shell = frame.project_geo(&Polygon::new(p.exterior().clone(), vec![]));
+            if shell.unsigned_area() > AREA_EPS_M2 && shell.difference(&hm).unsigned_area() <= AREA_EPS_M2 {
+                // every ring, filled holes too: their vertices come back bit-exact
+                snap.add(&Geom::Polygon(p.clone()));
+                let open: Vec<LineString<f64>> = p.interiors().iter().filter(|j| !is_filled(oid, j)).cloned().collect();
+                inside.push(if open.is_empty() { shell } else { frame.project_geo(&Polygon::new(p.exterior().clone(), open)) });
             }
         }
         let g = if inside.is_empty() {
@@ -403,6 +605,11 @@ pub fn fill_ring(ctx: &Ctx) -> Res<Value> {
         );
     }
     ctx.finish(&msg, json!({"created": n, "islands": islands, "covered": covered, "layerChecked": layer_checked}))
+}
+
+/// A ring's first vertex, bit for bit: a key to find the same ring read twice.
+fn ring_key(r: &LineString<f64>) -> [u64; 2] {
+    r.0.first().map_or([0; 2], |c| [c.x.to_bits(), c.y.to_bits()])
 }
 
 /// `mp` with every vertex that lies on another ring's edge (within [`SNAP_TOL_M`], between
@@ -478,10 +685,9 @@ fn within(a: &Rect<f64>, b: &Rect<f64>) -> bool {
     a.min().x >= b.min().x - m && a.min().y >= b.min().y - m && a.max().x <= b.max().x + m && a.max().y <= b.max().y + m
 }
 
-/// The outer rings of the active layer's polygons that may be islands in `boxes` (see
-/// [`islands_in`]); `None` when the layer is too large to read within what the command has
-/// left.
-fn layer_islands(ed: &selection::Editable, boxes: &[Rect<f64>]) -> Res<Option<Vec<(i64, LineString<f64>)>>> {
+/// The active layer's polygons that may be islands in `boxes` (see [`islands_in`]); `None`
+/// when the layer is too large to read within what the command has left.
+fn layer_islands(ed: &selection::Editable, boxes: &[Rect<f64>]) -> Res<Option<Vec<(i64, Polygon<f64>)>>> {
     let read;
     let feats = if ed.features.len() >= ed.layer.features {
         &ed.features
@@ -500,8 +706,9 @@ fn layer_islands(ed: &selection::Editable, boxes: &[Rect<f64>]) -> Res<Option<Ve
     Ok(Some(islands_in(feats, boxes)))
 }
 
-/// The outer rings of `feats` whose box lies within one of `boxes`, as (feature id, ring).
-fn islands_in(feats: &[Feature], boxes: &[Rect<f64>]) -> Vec<(i64, LineString<f64>)> {
+/// The polygons of `feats` (holes included) whose box lies within one of `boxes`, as
+/// (feature id, polygon).
+fn islands_in(feats: &[Feature], boxes: &[Rect<f64>]) -> Vec<(i64, Polygon<f64>)> {
     let mut out = Vec::new();
     for f in feats {
         let Some(g) = &f.geometry else { continue };
@@ -512,7 +719,7 @@ fn islands_in(feats: &[Feature], boxes: &[Rect<f64>]) -> Vec<(i64, LineString<f6
             if let Some(b) = p.bounding_rect()
                 && boxes.iter().any(|h| within(&b, h))
             {
-                out.push((f.id, p.into_inner().0));
+                out.push((f.id, p));
             }
         }
     }
@@ -704,7 +911,7 @@ fn perimeter(p: &Polygon<f64>) -> f64 {
     std::iter::once(p.exterior()).chain(p.interiors()).map(|r| Euclidean.length(r)).sum()
 }
 
-fn polygons_of(g: &Geom) -> MultiPolygon<f64> {
+pub(crate) fn polygons_of(g: &Geom) -> MultiPolygon<f64> {
     g.to_multi_polygon().unwrap_or_else(|| MultiPolygon(vec![]))
 }
 

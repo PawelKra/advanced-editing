@@ -396,6 +396,32 @@ def test_densify_write_guard_on_both_sides():
         check(r['changed'] == 1 and len(s.features('long')[0]['geometry']['coordinates']) > 41_500, r)
 
 
+def test_densify_tiny_distances_are_refused():
+    # far more subdivisions than fit an integer must still be refused, not overflow
+    lon, lat = PL
+    with Session(write_layer('short', [feature(linestring(lon, lat, [(0, 0), (1, 0)]), name='l')])) as s:
+        before = s.features('short')
+        s.activate('short')
+        s.select('short', [0])
+        for d in (1e-300, 5e-324, 1e-12, 1e-6):
+            e = s.error_of('densify', {'distance': d})
+            check('one command writes about 41 000 vertices' in e, (d, e))
+            check(s.features('short') == before, 'a refused densify changed the data')
+    # just inside and just outside the write budget, at a sub-millimetre distance
+    lines = write_layer('long', [feature(linestring(lon, lat, [(0, 0), (0.415, 0)]), name='a'),
+                                 feature(linestring(lon, lat, [(0, 5), (0.418, 5)]), name='b')])
+    with Session(lines) as s:
+        before = s.features('long')
+        s.activate('long')
+        s.select('long', [1])
+        e = s.error_of('densify', {'distance': 1e-5})
+        check('The result would be 1 features with about 41 8' in e, e)
+        check(s.features('long') == before, 'a refused densify changed the data')
+        s.select('long', [0])
+        r = s.plugin('densify', {'distance': 1e-5})
+        check(r['changed'] + r['unchanged'] == 1, r)
+
+
 # ---------- smooth ----------
 
 def test_smooth_keeps_line_ends_and_closes_rings():

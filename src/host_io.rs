@@ -570,6 +570,39 @@ pub mod budget {
         features as u64 * EDIT_FUEL_PER_FEATURE + vertices as u64 * WRITE_FUEL_PER_VERTEX
     }
 
+    /// Fuel a command may still spend on work it charges as it goes, all of it computed before
+    /// the first write: running out refuses the command with `why` and changes nothing.
+    pub struct Meter {
+        pub left: u64,
+        pub spent: u64,
+        /// Whether a `spend` was refused: the error to return is `why`, whatever the work in
+        /// progress made of it.
+        pub out: bool,
+        pub why: String,
+    }
+
+    impl Meter {
+        pub fn new(left: u64, why: impl Into<String>) -> Meter {
+            Meter { left, spent: 0, out: false, why: why.into() }
+        }
+
+        /// A meter that never runs out, to measure what some work is charged.
+        pub fn unlimited() -> Meter {
+            Meter::new(u64::MAX / 4, "")
+        }
+
+        pub fn spend(&mut self, fuel: u64) -> Res<()> {
+            if fuel > self.left {
+                self.left = 0;
+                self.out = true;
+                return Err(self.why.clone());
+            }
+            self.left -= fuel;
+            self.spent += fuel;
+            Ok(())
+        }
+    }
+
     /// Refuses a reply of `bytes` before it is parsed; `what` names it ("the 812 features of
     /// 'parcels'").
     pub fn check_read(bytes: usize, what: &str) -> Res<()> {

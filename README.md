@@ -53,7 +53,7 @@ Terms used throughout: **tool features** are the selected features of the **acti
 | Clip With Polygon | Keeps only the part of the target polygons inside the tool polygons. |
 | Rings ▾ Add Ring | Punches each tool polygon as a hole into the target polygon around it. |
 | Rings ▾ Delete Ring | Removes the holes of the selected polygons (or only those the locators touch). |
-| Rings ▾ Fill Ring | Fills holes with new polygons that copy the attributes of the polygon around them; islands in the hole stay out (on a layer too large to read, only selected polygons are checked: the message warns when the fill may overlap others). |
+| Rings ▾ Fill Ring | Fills holes with new polygons that copy the attributes of the polygon around them; islands in the hole stay out, their own holes are filled once (on a layer too large to read, only selected polygons are checked: the message warns when the fill may overlap others). |
 | Parts ▾ Add Part | Adds the tool polygons as new parts of one target polygon. |
 | Parts ▾ Delete Part | Deletes every part but the largest (or the parts the locators touch); never the last part. |
 | Parts ▾ Split Off Part | Moves every part but the largest (or the parts the locators touch) into new features with the same attributes. |
@@ -168,7 +168,7 @@ Cut With Polygon, Clip With Polygon, Split With Line and the division commands k
 | Topological editing | on the edge's line within 1 mm, through the vertex within 0.01 mm | Each such vertex is also inserted into the features that are **not** edited and share the edge. It looks in the edited layers (visible or not), then in the other visible layers of the same geometry type, never in the tools. On by default (panel checkbox, `topological` in scripts). |
 | Sliver threshold | 1 cm² (1e-4 m²) | Pieces of Cut, Clip and Split With Line smaller than this are dropped as precision noise. Fill Gap ignores gaps under 0.01 m² or narrower than 1 cm. |
 
-Topological editing uses RustGIS's own vertex editing, which moves nothing else, and is part of the command's undo step. The message counts it: *Split 2 feature(s) into 4 pieces; added 2 shared vertices to 2 neighbouring feature(s)*. RustGIS cannot read features by area, so each searched layer is read whole; a layer too large to read within the command's budget is skipped and named in the message.
+Topological editing uses RustGIS's own vertex editing, which moves nothing else, and is part of the command's undo step. The message counts it: *Split 2 feature(s) into 4 pieces; added 2 shared vertices to 2 neighbouring feature(s)*. RustGIS cannot read features by area, so each searched layer is read whole; a layer too large to read and update within the command's budget is skipped and named in the message.
 
 Edges are straight in the working frame. A cadastral edge stored in EPSG:2180 is therefore cut exactly where it lies; in a geographic view a 100 m edge drawn straight in longitude/latitude bends by about 0.2 mm in the frame, which tool snapping absorbs.
 
@@ -209,7 +209,7 @@ rustgis-cli run --plugin advanced-editing-0.1.1.rgplugin --data parcels.gpkg \
 
 ## Quality and testing
 
-The plugin is tested end to end: 220 tests drive the real WebAssembly module in a headless RustGIS and check the results against independent geometry, not against the plugin's own output.
+The plugin is tested end to end: 241 tests drive the real WebAssembly module in a headless RustGIS and check the results against independent geometry, not against the plugin's own output.
 
 | Check | Result |
 |---|---|
@@ -229,10 +229,13 @@ RustGIS stops a plugin command that computes for too long, so every command firs
 
 - A command edits about 20 000 vertices (fewer with many small features) and reads about 1.2 MB of features, roughly 30 000 vertices. Larger layers need a selection.
 - Densify, Smooth and Offset Curve write at most about 40 000 vertices they create.
-- Divide Into Equal Parts and Cut Off Percent check the division itself before cutting: for example about 150 parcels of 20 vertices into 4 parts, or one parcel of about 8000 vertices into 2 parts. Beyond that they ask for fewer polygons or the Divide Parcel tool.
+- Divide Into Equal Parts and Cut Off Percent check the division itself before cutting: for example about 150 parcels of 20 vertices into 4 parts, or one parcel of about 8000 vertices into 2 parts. Very large parcels also count the length of their edges and cuts: a 1000 km square into about 80 parts. Beyond that they ask for fewer polygons or the Divide Parcel tool.
 - Offset Curve's own work grows with how often a line comes back within the distance of itself, and for polygons faster than their vertex count: offsetting a smooth line of about 3000 vertices by 20 m takes about a third of a command, a dense zigzag much more. The jitter of densely digitised lines (GPS tracks) is left out of the work where that moves the offset by less than 0.004 % of the distance, so they can be offset by far more than their vertex spacing.
 - The Divide Parcel tool runs in the background with 60 times a command's budget and edits nothing (it adds a layer); it checks its division the same way.
-- Topological editing reads each layer it searches whole, within what is left of the command's read budget; a layer that does not fit is skipped and named in the message.
+- Topological editing reads each layer it searches whole, within what is left of the command's budget, which must also cover looking for the new vertices along the layer's edges and inserting the ones found (each insert costs about a three-thousandth of a command). A layer that does not fit is left unchanged, skipped and named in the message; the command itself still runs.
+- Cut, Clip and Split With Line index the segments of their tools; repeated identical segments count once. Tools with very many long segments close together (thousands of parallel parts many kilometres long) are refused before any change: select fewer tool features or simplify them.
+- Split With Line, Reshape and Trim/Extend compare only the segments of the line and the targets that lie near each other: two crossing lines of 10 000 segments each take a fraction of a command, two dense zigzags running over each other are refused. Trim/Extend searching the whole active layer counts reading, searching and editing it: about 2500 short lines.
+- Cut, Clip and Split With Line count snapping the tools, the boolean ops (which compare the tool and target edges lying side by side), placing the new vertices and writing the results before changing anything: a split into about 1000 pieces of a polygon (2000 of a line) fits, one into 4000 does not; a comb-shaped cutter of 400 teeth fits, one of 750 does not. Topological editing gets what is left of the command after that.
 - Merge With Attributes compares the segments of the lines it merges that lie close together: lines all meeting at one point are the costliest, and from about 700 of them it asks for fewer lines.
 - Coordinates come in longitude/latitude; very large features (over 20° of longitude, measured across the antimeridian where that is shorter) and the polar regions (beyond ±84°) are refused.
 

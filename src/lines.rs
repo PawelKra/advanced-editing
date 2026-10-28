@@ -15,9 +15,11 @@ use crate::Ctx;
 use crate::geojson::{
     self, Dim, Geom, P2, contours, from_lines, from_polygons, line_from_points, ring_points, shape_to_polygon,
 };
-use crate::host_io::{self, Feature, LAYER_READ_CAP, Res, budget};
+use crate::host_io::budget::{self, Meter};
+use crate::host_io::{self, Feature, LAYER_READ_CAP, Res};
 use crate::proj::{SNAP_TOL_M, VertexSnap};
 use crate::selection::{self, EditSpec, ToolSpec};
+use crate::polygons::{XRanges, slice_fuel, solver_for};
 use crate::topo;
 
 const SPLIT_USAGE: &str =
@@ -53,6 +55,11 @@ pub fn split_with_line(ctx: &Ctx) -> Res<Value> {
     spec.target_properties = true;
     spec.whole_layer = ctx.settings.whole_layer;
     let sel = selection::gather(&spec)?;
+    let read = budget::edit_fuel(
+        sel.target_count(),
+        budget::vertices(&sel.tools) + sel.targets.iter().map(|t| budget::vertices(&t.features)).sum::<usize>(),
+    );
+    let mut fuel = Meter::new(SPLIT_WORK_FUEL.saturating_sub(read), SCAN_TOO_MUCH);
     let frame = sel.frame()?;
     let mut pl = topo::Placer::new(frame);
     // targets first: their vertices and edges win over the tools'
@@ -67,30 +74,29 @@ pub fn split_with_line(ctx: &Ctx) -> Res<Value> {
         cutters.extend(paths_of(&pl.add_tool(t.geom()?)));
     }
     let metric: Vec<&Geom> = targets.iter().map(|t| &t.2).collect();
-    pl.snap_paths(&metric, &mut cutters);
-    let mut new_vertices = Vec::new();
-    // the split features (layer, feature, number of pieces) and their pieces in lon/lat, the
-    // one that stays in the feature first
-    let (mut done, mut results) = (Vec::new(), Vec::new());
-    for (owner, (layer, f, g)) in targets.iter().enumerate() {
-        let cut = pl.cutters_for(owner, &cutters, TOUCH_M);
-        let pieces = match g.dim() {
-            Dim::Polygon => split_polygons(g, &cut)?,
-            Dim::Line => split_lines(g, &cut),
-            Dim::Point => None,
-        };
-        let Some(pieces) = pieces else { continue };
-        done.push((*layer, *f, pieces.len()));
-        for p in &pieces {
-            results.push((owner, geojson::prepare_output(pl.unproject(p, &mut new_vertices))?));
-        }
+    let (split, new_vertices) = split_pieces(&mut pl, &metric, cutters, &mut fuel)?;
+    let pieces: usize = split.iter().map(|(_, ps)| ps.len()).sum();
+    let out_vertices: usize = split.iter().flat_map(|(_, ps)| ps).map(|g| g.num_coords()).sum();
+    // what the split features had is written as part of editing them
+    let in_vertices: usize = split.iter().map(|(o, _)| metric[*o].num_coords()).sum();
+    if fuel.spend(budget::write_fuel(pieces - split.len(), out_vertices.saturating_sub(in_vertices))).is_err() {
+        return Err(usage_err(
+            SPLIT_USAGE,
+            format!(
+                "the {} pieces have {} vertices, more than one command can write after computing them; \
+                 select fewer targets and repeat the command for the rest",
+                budget::count(pieces),
+                budget::count(out_vertices)
+            ),
+        ));
     }
-    topo::share_within(frame, results.iter_mut().map(|(o, g)| (*o, g)), &new_vertices);
-    let mut results = results.into_iter().map(|(_, g)| g);
+    // the piece that stays in the feature, then the new features
     let (mut writes, mut adds) = (Vec::new(), Vec::new());
-    for &(layer, f, n) in &done {
-        writes.extend(results.next().map(|g| (layer, f, g)));
-        adds.extend(results.by_ref().take(n - 1).map(|g| (layer, f, g)));
+    for (owner, ps) in split {
+        let (layer, f, _) = targets[owner];
+        let mut ps = ps.into_iter();
+        writes.extend(ps.next().map(|g| (layer, f, g)));
+        adds.extend(ps.map(|g| (layer, f, g)));
     }
     let (split, created) = (writes.len(), adds.len());
     if split == 0 {
@@ -105,10 +111,9 @@ pub fn split_with_line(ctx: &Ctx) -> Res<Value> {
         layers: &sel.layers,
         edited: sel.targets.iter().map(|t| t.layer.id).collect(),
         exclude,
-        spent: budget::edit_fuel(
-            sel.target_count(),
-            budget::vertices(&sel.tools) + sel.targets.iter().map(|t| budget::vertices(&t.features)).sum::<usize>(),
-        ),
+        // the pieces were computed and their writes charged
+        spent: read + fuel.spent,
+        limit: SPLIT_WORK_FUEL,
         read_whole: sel.targets_from_active.then_some(sel.active.id),
     };
     let shared = topo::plan(ctx.settings.topological, &scope, &new_vertices)?;
@@ -153,33 +158,56 @@ pub fn reshape(ctx: &Ctx) -> Res<Value> {
     spec.max_tools = Some(1);
     spec.whole_layer = ctx.settings.whole_layer;
     let sel = selection::gather(&spec)?;
+    let read = budget::edit_fuel(
+        sel.target_count(),
+        budget::vertices(&sel.tools) + sel.targets.iter().map(|t| budget::vertices(&t.features)).sum::<usize>(),
+    );
+    let mut fuel = Meter::new(LINE_WORK_FUEL.saturating_sub(read), SCAN_TOO_MUCH);
     let mut ed = Edits::new(VertexSnap::new(sel.frame()?, SNAP_TOL_M));
     let tool_paths = paths_of(&ed.snap.project(sel.tools[0].geom()?));
     let [tool] = tool_paths.as_slice() else {
         return Err(usage_err(RESHAPE_USAGE, "the reshaping line must be a single line with at least two positions"));
     };
-    let mut reshaped = 0usize;
+    let tool = Indexed::new(tool, &mut fuel)?;
+    // every result is computed before the first write, so running out of budget changes nothing
+    let (mut results, mut added) = (Vec::new(), 0usize);
     let mut reasons: Vec<String> = Vec::new();
     for set in &sel.targets {
         for f in &set.features {
             let g = ed.snap.project(f.geom()?);
             let r = match &g {
-                Geom::Polygon(_) | Geom::MultiPolygon(_) => reshape_polygons(&g, tool),
-                Geom::LineString(_) | Geom::MultiLineString(_) => reshape_lines(&g, tool),
+                Geom::Polygon(_) | Geom::MultiPolygon(_) => reshape_polygons(&g, &tool, &mut fuel),
+                Geom::LineString(_) | Geom::MultiLineString(_) => reshape_lines(&g, &tool, &mut fuel),
                 _ => Err("not a line or polygon".into()),
             };
             match r {
                 Ok(new) => {
-                    ed.write(set.layer.id, f.row, &new)?;
-                    reshaped += 1;
+                    added += new.num_coords().saturating_sub(g.num_coords());
+                    results.push((set.layer.id, f.row, ed.lonlat(&new)?));
                 }
+                Err(_) if fuel.out => return Err(fuel.why),
                 Err(why) => reasons.push(format!("feature {}: {why}", f.id)),
             }
         }
     }
+    let reshaped = results.len();
     if reshaped == 0 {
         reasons.truncate(3);
         return Err(usage_err(RESHAPE_USAGE, reasons.join("; ")));
+    }
+    if budget::write_fuel(0, added) > fuel.left {
+        return Err(usage_err(
+            RESHAPE_USAGE,
+            format!(
+                "the reshaped features gain {} vertices from the line, more than one command can write after \
+                 computing them; select fewer targets or simplify the line, and repeat the command for the rest",
+                budget::count(added)
+            ),
+        ));
+    }
+    for (layer, row, g) in &results {
+        host_io::set_geometry(*layer, *row, g)?;
+        ed.changed.push((*layer, *row));
     }
     ed.finish(tools_to_delete(&sel, ctx.settings.keep_tools))?;
     let msg = ctx.tr("Reshaped {n} feature(s)", &[("n", &reshaped.to_string())]);
@@ -328,10 +356,20 @@ pub fn trim_extend(ctx: &Ctx) -> Res<Value> {
     spec.max_tools = Some(1);
     spec.need_targets = false;
     spec.whole_layer = ctx.settings.whole_layer;
+    let layers = host_io::layers()?;
+    let others = host_io::active_layer(&layers)
+        .is_ok_and(|a| layers.iter().any(|l| l.id != a.id && l.is_vector() && l.selected > 0));
+    if spec.whole_layer || !others {
+        // the targets are searched below; the selection model's search for features touching
+        // the tool would read the layer a second time
+        spec.target_dims = &[];
+    }
     let sel = selection::gather(&spec)?;
+    let tool_vertices = budget::vertices(&sel.tools);
     let mut targets: Vec<(i64, Feature)> =
         sel.targets.iter().flat_map(|t| t.features.iter().map(|f| (t.layer.id, f.clone()))).collect();
     let frame_geoms: Vec<Geom>;
+    let mut fuel;
     if sel.targets_from_active {
         if sel.active.dim != Some(Dim::Line) {
             return Err(usage_err(TRIM_USAGE, "no lines are selected in another layer"));
@@ -341,10 +379,28 @@ pub fn trim_extend(ctx: &Ctx) -> Res<Value> {
         // cross it and those pointing at it from an end within the search radius.
         let radius = ctx.settings.distance_m;
         let tool_lonlat = sel.tools[0].geom()?.clone();
-        let reach = host_io::all_features_capped(&sel.active, LAYER_READ_CAP, false)?;
+        let layer = &sel.active;
+        let too_much = format!(
+            "Searching the {} features of '{}' for lines to trim or extend, and editing them, is more than one \
+             command can do. Select the lines to trim or extend in another layer, or lower Distance, and repeat \
+             the command for the rest.",
+            budget::count(layer.features),
+            layer.name
+        );
+        let Some((reach, bytes)) = host_io::all_features_within(layer, LAYER_READ_CAP, budget::MAX_READ_BYTES)? else {
+            // refused before parsing; this read says why
+            host_io::all_features_capped(layer, LAYER_READ_CAP, false)?;
+            return Err(too_much);
+        };
+        let read = budget::edit_fuel(0, tool_vertices) + bytes as u64 * budget::READ_FUEL_PER_BYTE;
+        fuel = Meter::new(LINE_WORK_FUEL.saturating_sub(read), too_much);
+        fuel.spend(budget::vertices(&reach) as u64 * PROJECT_FUEL_PER_VERTEX)?;
         let frame = crate::proj::Frame::for_geoms(std::iter::once(&tool_lonlat))?;
         let tool_m = paths_of(&frame.project(&tool_lonlat));
-        targets.clear();
+        let tool = index_all(&tool_m, &mut fuel)?;
+        // a line outside this box neither touches the tool nor ends within the radius of it
+        let near = tool.iter().filter_map(|t| t.tree.bbox()).reduce(box_union).map(|b| grow(b, radius + 2.0 * TOUCH_M));
+        let mut stack = Vec::new();
         for f in reach {
             if f.id == sel.tools[0].id {
                 continue;
@@ -352,19 +408,41 @@ pub fn trim_extend(ctx: &Ctx) -> Res<Value> {
             let Some(g) = f.geometry.as_ref() else { continue };
             let lines = paths_of(&frame.project(g));
             let lines: Vec<&Vec<P2>> = lines.iter().filter(|l| l.len() >= 2).collect();
-            let crosses = lines.iter().any(|l| !hits_any(l, &tool_m).is_empty());
-            let end_dist = lines
-                .iter()
-                .flat_map(|l| [l[0], l[l.len() - 1]])
-                .map(|q| dist_to_paths(q, &tool_m))
-                .fold(f64::INFINITY, f64::min);
-            let points_at = || {
-                lines.iter().any(|l| {
-                    let n = l.len();
-                    ray_hit(l[1], l[0], &tool_m).is_some() || ray_hit(l[n - 2], l[n - 1], &tool_m).is_some()
-                })
+            let in_reach = |l: &&Vec<P2>| {
+                let b = l.iter().fold([f64::MAX, f64::MAX, f64::MIN, f64::MIN], |b, q| box_union(b, [q[0], q[1], q[0], q[1]]));
+                near.is_none_or(|n| !(b[2] < n[0] || b[0] > n[2] || b[3] < n[1] || b[1] > n[3]))
             };
-            if crosses || (end_dist <= radius && points_at()) {
+            if !lines.iter().any(in_reach) {
+                continue;
+            }
+            let mut crosses = false;
+            for l in &lines {
+                if !hits_any(&Indexed::new(l, &mut fuel)?, &tool, &mut fuel)?.is_empty() {
+                    crosses = true;
+                    break;
+                }
+            }
+            let mut take = crosses;
+            if !take {
+                let mut end_dist = f64::INFINITY;
+                for l in &lines {
+                    for q in [l[0], l[l.len() - 1]] {
+                        end_dist = end_dist.min(dist_to_paths(q, &tool, &mut fuel)?);
+                    }
+                }
+                if end_dist <= radius {
+                    for l in &lines {
+                        let n = l.len();
+                        if ray_hit(l[1], l[0], &tool, &mut stack, &mut fuel)?.is_some()
+                            || ray_hit(l[n - 2], l[n - 1], &tool, &mut stack, &mut fuel)?.is_some()
+                        {
+                            take = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if take {
                 targets.push((sel.active.id, f));
             }
         }
@@ -374,8 +452,20 @@ pub fn trim_extend(ctx: &Ctx) -> Res<Value> {
                  Select the lines to trim or extend in another layer, or raise Distance."
             ));
         }
+        // projecting, editing and writing the targets; reading them is in `bytes`
+        let v = targets.iter().filter_map(|(_, f)| f.geometry.as_ref()).map(|g| g.num_coords()).sum::<usize>();
+        fuel.spend(targets.len() as u64 * budget::EDIT_FUEL_PER_FEATURE + v as u64 * PROJECT_FUEL_PER_VERTEX)?;
         frame_geoms = targets.iter().filter_map(|(_, f)| f.geometry.clone()).chain([tool_lonlat]).collect();
     } else {
+        let read = budget::edit_fuel(
+            sel.target_count(),
+            tool_vertices + sel.targets.iter().map(|t| budget::vertices(&t.features)).sum::<usize>(),
+        );
+        fuel = Meter::new(
+            LINE_WORK_FUEL.saturating_sub(read),
+            "Trimming or extending these lines to the boundary is more than one command can do. Select fewer \
+             lines or simplify the boundary, and repeat the command for the rest.",
+        );
         frame_geoms = sel.geoms().cloned().collect();
     }
     if targets.is_empty() {
@@ -385,26 +475,34 @@ pub fn trim_extend(ctx: &Ctx) -> Res<Value> {
         ));
     }
     let mut ed = Edits::new(VertexSnap::new(crate::proj::Frame::for_geoms(frame_geoms.iter())?, SNAP_TOL_M));
-    let tool = paths_of(&ed.snap.project(sel.tools[0].geom()?));
+    let tool_paths = paths_of(&ed.snap.project(sel.tools[0].geom()?));
+    let tool = index_all(&tool_paths, &mut fuel)?;
+    // every result is computed before the first write, so running out of budget changes nothing
+    let mut results = Vec::new();
     let (mut trimmed, mut extended) = (0usize, 0usize);
     let mut reasons = Vec::new();
     for (layer, f) in &targets {
         let g = ed.snap.project(f.geom()?);
-        match trim_extend_geom(&g, &tool) {
+        match trim_extend_geom(&g, &tool, &mut fuel) {
             Ok((new, was_trim)) => {
-                ed.write(*layer, f.row, &new)?;
+                results.push((*layer, f.row, ed.lonlat(&new)?));
                 if was_trim {
                     trimmed += 1;
                 } else {
                     extended += 1;
                 }
             }
+            Err(_) if fuel.out => return Err(fuel.why),
             Err(why) => reasons.push(format!("feature {}: {why}", f.id)),
         }
     }
     if trimmed + extended == 0 {
         reasons.truncate(3);
         return Err(usage_err(TRIM_USAGE, reasons.join("; ")));
+    }
+    for (layer, row, g) in &results {
+        host_io::set_geometry(*layer, *row, g)?;
+        ed.changed.push((*layer, *row));
     }
     ed.finish(None)?;
     let msg = ctx.tr(
@@ -520,13 +618,9 @@ fn seg_dist(q: P2, a: P2, b: P2) -> (f64, f64) {
     (dist(q, lerp(a, b, t)), t)
 }
 
-fn dist_to_paths(q: P2, paths: &[Vec<P2>]) -> f64 {
-    paths.iter().flat_map(|p| p.windows(2)).map(|w| seg_dist(q, w[0], w[1]).0).fold(f64::INFINITY, f64::min)
-}
-
 /// The parts of a line geometry, or the rings of a polygon, as deduplicated paths of at
 /// least two positions.
-fn paths_of(g: &Geom) -> Vec<Vec<P2>> {
+pub(crate) fn paths_of(g: &Geom) -> Vec<Vec<P2>> {
     let raw: Vec<Vec<P2>> = match g {
         Geom::LineString(l) => vec![ring_points(l)],
         Geom::MultiLineString(m) => m.0.iter().map(ring_points).collect(),
@@ -586,51 +680,284 @@ fn seg_range(k: usize, n: usize, len: f64) -> (f64, f64) {
     (if k == 0 { -e } else { 0.0 }, if k + 1 == n { 1.0 + e } else { 1.0 })
 }
 
-/// Crossings and touches of `a` with `b`, sorted along `a`, one per position.
-fn hits(a: &[P2], b: &[P2]) -> Vec<Hit> {
-    let (na, nb) = (a.len() - 1, b.len() - 1);
-    let b_closed = nb >= 3 && dist(b[0], b[nb]) <= DEDUP_M;
-    let mut out = Vec::new();
-    for i in 0..na {
-        let (a0, a1) = (a[i], a[i + 1]);
-        let (lo_a, hi_a) = seg_range(i, na, dist(a0, a1));
-        let (ax0, ax1) = (a0[0].min(a1[0]) - TOUCH_M, a0[0].max(a1[0]) + TOUCH_M);
-        let (ay0, ay1) = (a0[1].min(a1[1]) - TOUCH_M, a0[1].max(a1[1]) + TOUCH_M);
-        for j in 0..nb {
-            let (b0, b1) = (b[j], b[j + 1]);
-            if b0[0].max(b1[0]) < ax0 || b0[0].min(b1[0]) > ax1 || b0[1].max(b1[1]) < ay0 || b0[1].min(b1[1]) > ay1 {
+// ---------- segment scans ----------
+
+/// Split With Line, Reshape and Trim/Extend charge their segment scans a tree query at a time.
+impl Meter {
+    /// `boxes` boxes looked at and `pairs` segments compared exactly.
+    fn scan(&mut self, boxes: u64, pairs: u64) -> Res<()> {
+        self.spend(boxes * SCAN_FUEL_PER_BOX + pairs * SCAN_FUEL_PER_PAIR)
+    }
+}
+
+/// What one line command may spend in all, reading and writing included; the rest is left
+/// for the host calls and the message.
+const LINE_WORK_FUEL: u64 = budget::COMMAND_FUEL * 9 / 10;
+/// Split With Line counts all of its work as Cut does (see [`crate::polygons`]).
+const SPLIT_WORK_FUEL: u64 = crate::polygons::CUT_WORK_FUEL;
+/// Fuel per segment box built or looked at in a [`SegTree`] (or ring vertex visited), and per
+/// pair of segments (or point and segment) compared exactly, which takes up to four `hypot`s:
+/// upper bounds fitted to `diag-bench` runs on dense zigzags close together, crossing dense
+/// lines and wavy lines of 500 to 2000 vertices.
+const SCAN_FUEL_PER_BOX: u64 = 250;
+const SCAN_FUEL_PER_PAIR: u64 = 15_000;
+/// Fuel per vertex projected to search a whole layer (the projection part of
+/// [`budget::EDIT_FUEL_PER_VERTEX`]).
+const PROJECT_FUEL_PER_VERTEX: u64 = budget::EDIT_FUEL_PER_VERTEX - budget::BYTES_PER_VERTEX * budget::READ_FUEL_PER_BYTE;
+
+const SCAN_TOO_MUCH: &str = "Comparing the line with the targets segment by segment is more than one command can do. \
+     Select fewer targets, or simplify the line or the targets, and repeat the command for the rest.";
+
+/// Children per node of a [`SegTree`].
+const FAN: usize = 8;
+
+/// The boxes of a path's segments, then of runs of `FAN` boxes of the level below up to at
+/// most `FAN` boxes at the top. Consecutive segments lie near each other, so the runs stay
+/// small and a query looks at the few near it, finding its segments in path order.
+struct SegTree {
+    levels: Vec<Vec<BBox>>,
+}
+
+impl SegTree {
+    fn new(path: &[P2], fuel: &mut Meter) -> Res<SegTree> {
+        fuel.scan(2 * path.len() as u64, 0)?;
+        let mut levels = vec![path.windows(2).map(|w| seg_bbox(&[w[0], w[1]])).collect::<Vec<BBox>>()];
+        while levels[levels.len() - 1].len() > FAN {
+            let up = levels[levels.len() - 1].chunks(FAN).map(|c| c.iter().fold(c[0], |a, b| box_union(a, *b))).collect();
+            levels.push(up);
+        }
+        Ok(SegTree { levels })
+    }
+
+    /// The box of the whole path.
+    fn bbox(&self) -> Option<BBox> {
+        let top = &self.levels[self.levels.len() - 1];
+        top.first().map(|&b| top.iter().fold(b, |a, c| box_union(a, *c)))
+    }
+
+    /// The segments whose boxes meet `q` into `out`, in path order; returns how many boxes it
+    /// looked at.
+    fn query(&self, q: BBox, stack: &mut Vec<(usize, usize)>, out: &mut Vec<usize>) -> u64 {
+        out.clear();
+        stack.clear();
+        let top = self.levels.len() - 1;
+        stack.extend((0..self.levels[top].len()).rev().map(|k| (top, k)));
+        let mut seen = 0;
+        while let Some((l, k)) = stack.pop() {
+            seen += 1;
+            let b = self.levels[l][k];
+            if b[2] < q[0] || b[0] > q[2] || b[3] < q[1] || b[1] > q[3] {
                 continue;
             }
-            let (lo_b, hi_b) = if b_closed { (0.0, 1.0) } else { seg_range(j, nb, dist(b0, b1)) };
-            if let Some((t, u)) = seg_inter(a0, a1, b0, b1)
-                && t >= lo_a
-                && (t < hi_a || (i + 1 == na && t <= hi_a))
-                && u >= lo_b
-                && u <= hi_b
-            {
-                out.push(Hit { i, t, j, u: u.clamp(0.0, 1.0), pb: lerp(b0, b1, u.clamp(0.0, 1.0)) });
+            if l == 0 {
+                out.push(k);
+            } else {
+                let end = ((k + 1) * FAN).min(self.levels[l - 1].len());
+                stack.extend((k * FAN..end).rev().map(|c| (l - 1, c)));
             }
         }
+        seen
+    }
+
+    /// The smallest `d(k)` over the segments, `d(k)` being at least the distance from `q` to
+    /// segment `k`'s box. Nearer boxes are looked at first and boxes farther than the smallest
+    /// so far are skipped. Returns it with the boxes looked at and the segments measured.
+    fn nearest(&self, q: P2, stack: &mut Vec<(usize, usize, f64)>, mut d: impl FnMut(usize) -> f64) -> (f64, u64, u64) {
+        let box_dist = |b: BBox| {
+            let (dx, dy) = ((b[0] - q[0]).max(q[0] - b[2]).max(0.0), (b[1] - q[1]).max(q[1] - b[3]).max(0.0));
+            (dx * dx + dy * dy).sqrt()
+        };
+        let push = |stack: &mut Vec<(usize, usize, f64)>, l: usize, ks: std::ops::Range<usize>| {
+            let from = stack.len();
+            stack.extend(ks.map(|k| (l, k, box_dist(self.levels[l][k]))));
+            stack[from..].sort_unstable_by(|x, y| y.2.total_cmp(&x.2));
+        };
+        stack.clear();
+        let top = self.levels.len() - 1;
+        push(stack, top, 0..self.levels[top].len());
+        let (mut best, mut seen, mut measured) = (f64::INFINITY, 0, 0);
+        while let Some((l, k, bd)) = stack.pop() {
+            seen += 1;
+            // the slack covers rounding: a segment as near as the best must not be skipped
+            if bd > best + 1e-6 + 1e-9 * best {
+                continue;
+            }
+            if l == 0 {
+                best = best.min(d(k));
+                measured += 1;
+            } else {
+                push(stack, l - 1, k * FAN..((k + 1) * FAN).min(self.levels[l - 1].len()));
+            }
+        }
+        (best, seen, measured)
+    }
+}
+
+fn box_union(a: BBox, b: BBox) -> BBox {
+    [a[0].min(b[0]), a[1].min(b[1]), a[2].max(b[2]), a[3].max(b[3])]
+}
+
+fn grow(b: BBox, r: f64) -> BBox {
+    [b[0] - r, b[1] - r, b[2] + r, b[3] + r]
+}
+
+/// A path (metres) with its [`SegTree`].
+struct Indexed<'a> {
+    pts: &'a [P2],
+    tree: SegTree,
+}
+
+impl<'a> Indexed<'a> {
+    fn new(pts: &'a [P2], fuel: &mut Meter) -> Res<Indexed<'a>> {
+        Ok(Indexed { pts, tree: SegTree::new(pts, fuel)? })
+    }
+}
+
+fn index_all<'a>(paths: &'a [Vec<P2>], fuel: &mut Meter) -> Res<Vec<Indexed<'a>>> {
+    paths.iter().map(|p| Indexed::new(p, fuel)).collect()
+}
+
+/// Crossings and touches of `a` with `b`, sorted along `a`, one per position. Only segment
+/// pairs whose boxes meet are compared, each shorter path's segment against the other's
+/// tree, in the order of comparing every pair.
+fn hits(a: &Indexed, b: &Indexed, fuel: &mut Meter) -> Res<Vec<Hit>> {
+    let (a, ta, b, tb) = (a.pts, &a.tree, b.pts, &b.tree);
+    let (na, nb) = (a.len() - 1, b.len() - 1);
+    let b_closed = nb >= 3 && dist(b[0], b[nb]) <= DEDUP_M;
+    let pair = |i: usize, j: usize| {
+        let (a0, a1) = (a[i], a[i + 1]);
+        let (ax0, ax1) = (a0[0].min(a1[0]) - TOUCH_M, a0[0].max(a1[0]) + TOUCH_M);
+        let (ay0, ay1) = (a0[1].min(a1[1]) - TOUCH_M, a0[1].max(a1[1]) + TOUCH_M);
+        let (b0, b1) = (b[j], b[j + 1]);
+        if b0[0].max(b1[0]) < ax0 || b0[0].min(b1[0]) > ax1 || b0[1].max(b1[1]) < ay0 || b0[1].min(b1[1]) > ay1 {
+            return None;
+        }
+        let (lo_a, hi_a) = seg_range(i, na, dist(a0, a1));
+        let (lo_b, hi_b) = if b_closed { (0.0, 1.0) } else { seg_range(j, nb, dist(b0, b1)) };
+        match seg_inter(a0, a1, b0, b1) {
+            Some((t, u)) if t >= lo_a && (t < hi_a || (i + 1 == na && t <= hi_a)) && u >= lo_b && u <= hi_b => {
+                Some(Hit { i, t, j, u: u.clamp(0.0, 1.0), pb: lerp(b0, b1, u.clamp(0.0, 1.0)) })
+            }
+            _ => None,
+        }
+    };
+    let (mut stack, mut cand, mut out) = (Vec::new(), Vec::new(), Vec::new());
+    // the trees pad by twice the touch distance, so no pair within it is missed to rounding
+    if na <= nb {
+        for i in 0..na {
+            let seen = tb.query(grow(ta.levels[0][i], 2.0 * TOUCH_M), &mut stack, &mut cand);
+            fuel.scan(seen, cand.len() as u64)?;
+            out.extend(cand.iter().filter_map(|&j| pair(i, j)));
+        }
+    } else {
+        for j in 0..nb {
+            let seen = ta.query(grow(tb.levels[0][j], 2.0 * TOUCH_M), &mut stack, &mut cand);
+            fuel.scan(seen, cand.len() as u64)?;
+            out.extend(cand.iter().filter_map(|&i| pair(i, j)));
+        }
+        out.sort_by_key(|h| (h.i, h.j));
     }
     out.sort_by(|x, y| x.pos_a().total_cmp(&y.pos_a()));
     out.dedup_by(|y, x| dist(x.pb, y.pb) <= DEDUP_M);
-    out
+    Ok(out)
 }
 
-fn hits_any(a: &[P2], others: &[Vec<P2>]) -> Vec<Hit> {
-    let mut v: Vec<Hit> = others.iter().flat_map(|b| hits(a, b)).collect();
+fn hits_any(a: &Indexed, others: &[Indexed], fuel: &mut Meter) -> Res<Vec<Hit>> {
+    let mut v = Vec::new();
+    for b in others {
+        v.extend(hits(a, b, fuel)?);
+    }
     v.sort_by(|x, y| x.pos_a().total_cmp(&y.pos_a()));
-    v
+    Ok(v)
+}
+
+/// The distance from `q` to the nearest segment of `paths`.
+fn dist_to_paths(q: P2, paths: &[Indexed], fuel: &mut Meter) -> Res<f64> {
+    let (mut best, mut stack) = (f64::INFINITY, Vec::new());
+    for p in paths {
+        let pts = p.pts;
+        let (d, seen, measured) = p.tree.nearest(q, &mut stack, |k| seg_dist(q, pts[k], pts[k + 1]).0);
+        fuel.scan(seen, measured)?;
+        best = best.min(d);
+    }
+    Ok(best)
 }
 
 // ---------- split ----------
 
+/// (target, its pieces in lon/lat), the piece that stays in the feature first.
+pub type Pieces = Vec<(usize, Vec<Geom>)>;
+
+/// The pieces of the targets (`metric`, registered with `pl` in this order) that the tool
+/// paths (metres, registered with `pl` too) split, and the vertices placed on the targets'
+/// edges. Charges `fuel` for all of it: snapping, splitting, placing and sharing the new
+/// vertices.
+pub fn split_pieces(
+    pl: &mut topo::Placer,
+    metric: &[&Geom],
+    mut cutters: Vec<Vec<P2>>,
+    fuel: &mut Meter,
+) -> Res<(Pieces, Vec<topo::NewVertex>)> {
+    pl.snap_paths(metric, &mut cutters, fuel)?;
+    let (mut new_vertices, mut results) = (Vec::new(), Vec::new());
+    for (owner, g) in metric.iter().enumerate() {
+        let cut = pl.cutters_for(owner, &cutters, TOUCH_M, fuel)?;
+        let pieces = match g.dim() {
+            Dim::Polygon => {
+                // what i_overlay's slice sweeps: the rings and every cut line whose box meets them
+                let bb = g.bbox().map(|b| [b.min().x, b.min().y, b.max().x, b.max().y]);
+                let near: Vec<&[P2]> = cut
+                    .iter()
+                    .filter(|c| {
+                        matches!((bb, path_bbox(c)), (Some(a), Some(b)) if !(b[2] < a[0] || b[0] > a[2] || b[3] < a[1] || b[1] > a[3]))
+                    })
+                    .map(|c| &c[..])
+                    .collect();
+                let parts = crate::polygons::polygons_of(g).0;
+                // cut lines that come nowhere near the boundary split the polygon only where
+                // one lies inside it, closing a loop there; most targets of a long line are
+                // merely in its box
+                let crossings = pl.crossings(owner);
+                if crossings == 0 {
+                    fuel.scan(near.len() as u64 * g.num_coords() as u64, 0)?;
+                }
+                if crossings == 0 && !near.iter().any(|c| parts.iter().any(|p| inside_polygon(c[0], p))) {
+                    None
+                } else {
+                    let cx = XRanges::new(near);
+                    let gx = XRanges::of_polygons(&parts);
+                    let (segments, pairs) = (gx.len() + cx.len(), gx.pairs + cx.pairs + gx.with(&cx));
+                    fuel.spend(gx.fuel() + cx.fuel() + slice_fuel(segments, pairs, crossings))?;
+                    split_polygons(g, &cut, solver_for(segments, pairs))?
+                }
+            }
+            Dim::Line => split_lines(g, &cut, fuel)?,
+            Dim::Point => None,
+        };
+        let Some(pieces) = pieces else { continue };
+        let pieces = pieces.iter().map(|p| geojson::prepare_output(pl.unproject(p, &mut new_vertices, fuel)?));
+        results.push((owner, pieces.collect::<Res<Vec<Geom>>>()?));
+    }
+    let all = results.iter_mut().flat_map(|(o, ps)| ps.iter_mut().map(|g| (*o, g)));
+    topo::share_within(pl.frame(), all, &new_vertices, fuel)?;
+    Ok((results, new_vertices))
+}
+
+fn inside_polygon(q: P2, p: &Polygon<f64>) -> bool {
+    point_in_ring(q, &ring_points(p.exterior())) && !p.interiors().iter().any(|h| point_in_ring(q, &ring_points(h)))
+}
+
+fn path_bbox(p: &[P2]) -> Option<BBox> {
+    let q = p.first()?;
+    Some(p.iter().fold([q[0], q[1], q[0], q[1]], |b, q| [b[0].min(q[0]), b[1].min(q[1]), b[2].max(q[0]), b[3].max(q[1])]))
+}
+
 /// Split pieces below this are dropped as precision noise, as Cut and Clip drop theirs.
 const SPLIT_SLIVER_M2: f64 = crate::polygons::AREA_EPS_M2;
 
-/// Splits one polygon by the cutter paths with i_overlay's `slice`. Collinear vertices are
-/// kept, so the vertices shared with neighbours survive.
-pub fn split_polygon(p: &Polygon<f64>, cutters: &[Vec<P2>]) -> Vec<Polygon<f64>> {
+/// Splits one polygon by the cutter paths with i_overlay's `slice` and `solver`. Collinear
+/// vertices are kept, so the vertices shared with neighbours survive.
+pub fn split_polygon(p: &Polygon<f64>, cutters: &[Vec<P2>], solver: Solver) -> Vec<Polygon<f64>> {
     use geo::BoundingRect;
     let Some(bb) = p.bounding_rect() else { return vec![] };
     let near: Vec<Vec<P2>> = cutters
@@ -648,18 +975,18 @@ pub fn split_polygon(p: &Polygon<f64>, cutters: &[Vec<P2>]) -> Vec<Polygon<f64>>
         return vec![p.clone()];
     }
     let opts = OverlayOptions { preserve_input_collinear: true, preserve_output_collinear: true, ..Default::default() };
-    let shapes = contours(p).slice_custom_by(&near, FillRule::EvenOdd, opts, Solver::default());
+    let shapes = contours(p).slice_custom_by(&near, FillRule::EvenOdd, opts, solver);
     shapes.iter().map(|s| shape_to_polygon(s)).filter(|q| q.unsigned_area() >= SPLIT_SLIVER_M2).collect()
 }
 
 /// The pieces of a (multi)polygon cut by `cutters`, the one that stays in the feature first;
 /// `None` when no part is cut.
-fn split_polygons(g: &Geom, cutters: &[Vec<P2>]) -> Res<Option<Vec<Geom>>> {
+fn split_polygons(g: &Geom, cutters: &[Vec<P2>], solver: Solver) -> Res<Option<Vec<Geom>>> {
     let parts = g.to_multi_polygon().map(|m| m.0).unwrap_or_default();
     let mut kept = Vec::new();
     let mut pieces = Vec::new();
     for p in parts {
-        let s = split_polygon(&p, cutters);
+        let s = split_polygon(&p, cutters, solver);
         if s.len() >= 2 {
             let (a0, a1) = (p.unsigned_area(), s.iter().map(|q| q.unsigned_area()).sum::<f64>());
             if (a0 - a1).abs() > 1e-6 * a0 + 1e-4 {
@@ -673,8 +1000,9 @@ fn split_polygons(g: &Geom, cutters: &[Vec<P2>]) -> Res<Option<Vec<Geom>>> {
     if pieces.is_empty() {
         return Ok(None);
     }
-    pieces.sort_by(|a, b| b.unsigned_area().total_cmp(&a.unsigned_area()));
-    let mut it = pieces.into_iter();
+    let mut pieces: Vec<(f64, Polygon<f64>)> = pieces.into_iter().map(|p| (p.unsigned_area(), p)).collect();
+    pieces.sort_by(|a, b| b.0.total_cmp(&a.0));
+    let mut it = pieces.into_iter().map(|(_, p)| p);
     let mut first = vec![it.next().unwrap()];
     first.extend(kept);
     Ok(Some(std::iter::once(from_polygons(first)).chain(it.map(Geom::Polygon)).collect()))
@@ -682,8 +1010,8 @@ fn split_polygons(g: &Geom, cutters: &[Vec<P2>]) -> Res<Option<Vec<Geom>>> {
 
 /// Splits a line at its crossings with the cutters. A closed line is not cut at its start
 /// position: the first and last piece are joined.
-pub fn split_line(line: &[P2], cutters: &[Vec<P2>]) -> Vec<Vec<P2>> {
-    let hits = hits_any(line, cutters);
+fn split_line(line: &[P2], cutters: &[Indexed], fuel: &mut Meter) -> Res<Vec<Vec<P2>>> {
+    let hits = hits_any(&Indexed::new(line, fuel)?, cutters, fuel)?;
     let mut out = Vec::new();
     let mut cur = vec![line[0]];
     let mut h = 0;
@@ -709,16 +1037,17 @@ pub fn split_line(line: &[P2], cutters: &[Vec<P2>]) -> Vec<Vec<P2>> {
         joined.extend_from_slice(&out[0][1..]);
         out[0] = joined;
     }
-    out
+    Ok(out)
 }
 
-fn split_lines(g: &Geom, cutters: &[Vec<P2>]) -> Option<Vec<Geom>> {
-    let parts = g.to_multi_line()?.0;
+fn split_lines(g: &Geom, cutters: &[Vec<P2>], fuel: &mut Meter) -> Res<Option<Vec<Geom>>> {
+    let Some(parts) = g.to_multi_line().map(|m| m.0) else { return Ok(None) };
+    let cutters = index_all(cutters, fuel)?;
     let mut kept = Vec::new();
     let mut pieces: Vec<Vec<P2>> = Vec::new();
     for l in parts {
         let pts = ring_points(&l);
-        let s = if pts.len() >= 2 { split_line(&pts, cutters) } else { vec![] };
+        let s = if pts.len() >= 2 { split_line(&pts, &cutters, fuel)? } else { vec![] };
         if s.len() >= 2 {
             pieces.extend(s);
         } else {
@@ -726,13 +1055,15 @@ fn split_lines(g: &Geom, cutters: &[Vec<P2>]) -> Option<Vec<Geom>> {
         }
     }
     if pieces.is_empty() {
-        return None;
+        return Ok(None);
     }
-    pieces.sort_by(|a, b| path_len(b).total_cmp(&path_len(a)));
-    let mut it = pieces.into_iter();
+    // lengths first: a line cut thousands of times would measure them in every comparison
+    let mut pieces: Vec<(f64, Vec<P2>)> = pieces.into_iter().map(|p| (path_len(&p), p)).collect();
+    pieces.sort_by(|a, b| b.0.total_cmp(&a.0));
+    let mut it = pieces.into_iter().map(|(_, p)| p);
     let mut first = vec![line_from_points(&it.next().unwrap())];
     first.extend(kept);
-    Some(std::iter::once(from_lines(first)).chain(it.map(|p| Geom::LineString(line_from_points(&p)))).collect())
+    Ok(Some(std::iter::once(from_lines(first)).chain(it.map(|p| Geom::LineString(line_from_points(&p)))).collect()))
 }
 
 // ---------- reshape ----------
@@ -759,19 +1090,39 @@ fn ahead(from: f64, x: f64, n: usize) -> f64 {
     (x - from).rem_euclid(n as f64)
 }
 
-fn segments_cross(a: &[P2]) -> bool {
+fn segments_cross(a: &[P2], fuel: &mut Meter) -> Res<bool> {
     let n = a.len().saturating_sub(1);
+    let tree = SegTree::new(a, fuel)?;
+    let (mut stack, mut cand) = (Vec::new(), Vec::new());
     for i in 0..n {
-        for j in i + 2..n {
+        let seen = tree.query(grow(tree.levels[0][i], TOUCH_M), &mut stack, &mut cand);
+        // the segment itself and its neighbours are always found, and skipped
+        fuel.scan(seen + cand.len() as u64, cand.iter().filter(|&&j| j >= i + 2).count() as u64)?;
+        for &j in cand.iter().filter(|&&j| j >= i + 2) {
             if let Some((t, u)) = seg_inter(a[i], a[i + 1], a[j], a[j + 1])
                 && (0.0..=1.0).contains(&t)
                 && (0.0..=1.0).contains(&u)
             {
-                return true;
+                return Ok(true);
             }
         }
     }
-    false
+    Ok(false)
+}
+
+/// The distance from `q` to the nearest edge of `ring` and the ring position there, when it
+/// is within `TOUCH_M` (the first such edge in ring order on a tie).
+fn touching(ring: &Indexed, q: P2, stack: &mut Vec<(usize, usize)>, cand: &mut Vec<usize>, fuel: &mut Meter) -> Res<(f64, f64)> {
+    let seen = ring.tree.query(grow([q[0], q[1], q[0], q[1]], 2.0 * TOUCH_M), stack, cand);
+    fuel.scan(seen, cand.len() as u64)?;
+    let mut best = (f64::INFINITY, 0.0);
+    for &j in cand.iter() {
+        let (d, t) = seg_dist(q, ring.pts[j], ring.pts[j + 1]);
+        if d < best.0 {
+            best = (d, j as f64 + t);
+        }
+    }
+    Ok(best)
 }
 
 /// Whether `tool`, between its first and last crossing `hs` of a closed ring, meets the ring
@@ -779,18 +1130,16 @@ fn segments_cross(a: &[P2]) -> bool {
 /// (`on_ba` tells the arc of a ring position): along an edge, at a point, or at a vertex of the
 /// line within `TOUCH_M` of the ring, which `hs` may miss. Keeping that arc would pinch the
 /// ring into two pieces.
-fn cuts_in_two(ring: &[P2], tool: &[P2], hs: &[Hit], on_ba: impl Fn(f64) -> bool) -> bool {
+fn cuts_in_two(
+    ring_ix: &Indexed,
+    tool: &[P2],
+    hs: &[Hit],
+    on_ba: impl Fn(f64) -> bool,
+    fuel: &mut Meter,
+) -> Res<bool> {
+    let ring = ring_ix.pts;
     let (h0, h1) = (hs[0], hs[hs.len() - 1]);
-    let nearest = |q: P2| {
-        let mut best = (f64::INFINITY, 0.0);
-        for (j, e) in ring.windows(2).enumerate() {
-            let (d, t) = seg_dist(q, e[0], e[1]);
-            if d < best.0 {
-                best = (d, j as f64 + t);
-            }
-        }
-        best
-    };
+    let (mut stack, mut cand) = (Vec::new(), Vec::new());
     // (position along the tool, position along the ring)
     let mut meets: Vec<(f64, f64)> = hs[1..hs.len() - 1].iter().map(|h| (h.pos_a(), h.pos_b())).collect();
     for k in h0.i + 1..=h1.i {
@@ -798,13 +1147,13 @@ fn cuts_in_two(ring: &[P2], tool: &[P2], hs: &[Hit], on_ba: impl Fn(f64) -> bool
         if dist(q, h0.pb) <= TOUCH_M || dist(q, h1.pb) <= TOUCH_M || hs.iter().any(|h| dist(q, h.pb) <= TOUCH_M) {
             continue;
         }
-        let (d, pos) = nearest(q);
+        let (d, pos) = touching(ring_ix, q, &mut stack, &mut cand, fuel)?;
         if d <= TOUCH_M {
             meets.push((k as f64, pos));
         }
     }
     if meets.is_empty() {
-        return false;
+        return Ok(false);
     }
     meets.sort_by(|x, y| x.0.total_cmp(&y.0));
     let at = |pos: f64| {
@@ -814,29 +1163,27 @@ fn cuts_in_two(ring: &[P2], tool: &[P2], hs: &[Hit], on_ba: impl Fn(f64) -> bool
     let along: Vec<f64> =
         std::iter::once(h0.pos_a()).chain(meets.iter().map(|m| m.0)).chain(std::iter::once(h1.pos_a())).collect();
     // -1 outside, 0 along the ring, 1 inside
-    let stretch: Vec<i8> = along
-        .windows(2)
-        .map(|w| {
-            let q = at(0.5 * (w[0] + w[1]));
-            if nearest(q).0 <= TOUCH_M {
-                0
-            } else if point_in_ring(q, ring) {
-                1
-            } else {
-                -1
-            }
-        })
-        .collect();
+    let mut stretch: Vec<i8> = Vec::with_capacity(along.len());
+    for w in along.windows(2) {
+        let q = at(0.5 * (w[0] + w[1]));
+        stretch.push(if touching(ring_ix, q, &mut stack, &mut cand, fuel)?.0 <= TOUCH_M {
+            0
+        } else {
+            fuel.scan(ring.len() as u64, 0)?;
+            if point_in_ring(q, ring) { 1 } else { -1 }
+        });
+    }
     let touch: Vec<bool> = stretch.windows(2).map(|w| w[0] >= 0 && w[1] >= 0 && w[0].max(w[1]) > 0).collect();
-    [true, false].into_iter().any(|arc| {
+    Ok([true, false].into_iter().any(|arc| {
         let mut on = meets.iter().zip(&touch).filter(|(m, _)| on_ba(m.1) == arc).peekable();
         on.peek().is_some() && on.all(|(_, &t)| t)
-    })
+    }))
 }
 
 /// Replaces the stretch of a closed ring between the first and last crossing of `tool`.
 /// Refuses a line that would cut the ring in two (`hole`: the ring is a hole).
-fn reshape_ring(ring: &[P2], tool: &[P2], hs: &[Hit], hole: bool) -> Res<Vec<P2>> {
+fn reshape_ring(ring_ix: &Indexed, tool: &[P2], hs: &[Hit], hole: bool, fuel: &mut Meter) -> Res<Vec<P2>> {
+    let ring = ring_ix.pts;
     let n = ring.len() - 1;
     let (h0, h1) = (hs[0], hs[hs.len() - 1]);
     let (sa, sb) = (h0.pos_b(), h1.pos_b());
@@ -847,7 +1194,7 @@ fn reshape_ring(ring: &[P2], tool: &[P2], hs: &[Hit], hole: bool) -> Res<Vec<P2>
     mid.extend_from_slice(&tool[h0.i + 1..=h1.i.max(h0.i)]);
     mid.push(h1.pb);
     dedup(&mut mid, DEDUP_M);
-    if segments_cross(&mid) {
+    if segments_cross(&mid, fuel)? {
         return Err("the reshaping line crosses itself".into());
     }
     // A candidate keeps one arc of the ring; it is only simple if the line does not cross that
@@ -859,7 +1206,7 @@ fn reshape_ring(ring: &[P2], tool: &[P2], hs: &[Hit], hole: bool) -> Res<Vec<P2>
     };
     let on_ba = |h: &Hit| on_ba_at(h.pos_b());
     // keeping the other side instead is not what the line asks for
-    if cuts_in_two(ring, tool, hs, on_ba_at) {
+    if cuts_in_two(ring_ix, tool, hs, on_ba_at, fuel)? {
         return Err(if hole {
             "This line would cut the hole in two; reshape one side of it at a time".into()
         } else {
@@ -894,7 +1241,7 @@ fn reshape_ring(ring: &[P2], tool: &[P2], hs: &[Hit], hole: bool) -> Res<Vec<P2>
     Ok(best)
 }
 
-fn reshape_polygons(g: &Geom, tool: &[P2]) -> Res<Geom> {
+fn reshape_polygons(g: &Geom, tool: &Indexed, fuel: &mut Meter) -> Res<Geom> {
     let mut parts: Vec<Vec<Vec<P2>>> = g
         .to_multi_polygon()
         .unwrap_or(MultiPolygon(vec![]))
@@ -908,7 +1255,7 @@ fn reshape_polygons(g: &Geom, tool: &[P2]) -> Res<Geom> {
             if r.len() < 4 {
                 continue;
             }
-            let hs = hits(tool, r);
+            let hs = hits(tool, &Indexed::new(r, fuel)?, fuel)?;
             if !hs.is_empty() {
                 crossed.push((pi, ri, hs));
             }
@@ -922,7 +1269,9 @@ fn reshape_polygons(g: &Geom, tool: &[P2]) -> Res<Geom> {
     if hs.len() < 2 {
         return Err("the line must cross the boundary at least twice".into());
     }
-    let new = reshape_ring(&parts[pi][ri], tool, &hs, ri > 0)?;
+    let new = reshape_ring(&Indexed::new(&parts[pi][ri], fuel)?, tool.pts, &hs, ri > 0, fuel)?;
+    // each other part or hole is tested against the new ring
+    fuel.scan((parts.len() + parts[pi].len()) as u64 * new.len() as u64, 0)?;
     if ri == 0 {
         for (pj, other) in parts.iter().enumerate() {
             if pj != pi && point_in_ring(other[0][0], &new) {
@@ -956,8 +1305,9 @@ fn reshape_polygons(g: &Geom, tool: &[P2]) -> Res<Geom> {
 
 /// Reshapes one line part; `None` when the tool neither crosses it twice nor continues one of
 /// its ends.
-fn reshape_line(line: &[P2], tool: &[P2]) -> Option<Vec<P2>> {
-    let hs = hits(tool, line);
+fn reshape_line(line: &[P2], tool_ix: &Indexed, fuel: &mut Meter) -> Res<Option<Vec<P2>>> {
+    let hs = hits(tool_ix, &Indexed::new(line, fuel)?, fuel)?;
+    let tool = tool_ix.pts;
     let n = line.len();
     let (first, last) = (line[0], line[n - 1]);
     let (t0, t1) = (tool[0], tool[tool.len() - 1]);
@@ -987,16 +1337,20 @@ fn reshape_line(line: &[P2], tool: &[P2]) -> Option<Vec<P2>> {
         out = tool.to_vec();
         out.extend_from_slice(&line[1..]);
     } else {
-        return None;
+        return Ok(None);
     }
     dedup(&mut out, DEDUP_M);
-    (out.len() >= 2).then_some(out)
+    Ok((out.len() >= 2).then_some(out))
 }
 
-fn reshape_lines(g: &Geom, tool: &[P2]) -> Res<Geom> {
+fn reshape_lines(g: &Geom, tool: &Indexed, fuel: &mut Meter) -> Res<Geom> {
     let mut parts: Vec<Vec<P2>> = g.to_multi_line().map(|m| m.0.iter().map(ring_points).collect()).unwrap_or_default();
-    let mut done: Vec<(usize, Vec<P2>)> =
-        parts.iter().enumerate().filter_map(|(k, p)| Some((k, reshape_line(p, tool)?))).collect();
+    let mut done: Vec<(usize, Vec<P2>)> = Vec::new();
+    for (k, p) in parts.iter().enumerate() {
+        if let Some(new) = reshape_line(p, tool, fuel)? {
+            done.push((k, new));
+        }
+    }
     match done.len() {
         0 => Err("the line must cross the target twice, or start or end at one of its ends".into()),
         1 => {
@@ -1897,28 +2251,50 @@ pub fn buffer_polygons(p: &MultiPolygon<f64>, d: f64) -> MultiPolygon<f64> {
 
 /// Distance along the ray from `p` (direction `from` -> `p`) to the first crossing with the
 /// boundary, and that crossing.
-fn ray_hit(from: P2, p: P2, boundary: &[Vec<P2>]) -> Option<(f64, P2)> {
+fn ray_hit(
+    from: P2,
+    p: P2,
+    boundary: &[Indexed],
+    stack: &mut Vec<(usize, usize)>,
+    fuel: &mut Meter,
+) -> Res<Option<(f64, P2)>> {
     let len = dist(from, p);
     if len <= 0.0 {
-        return None;
+        return Ok(None);
     }
     let mut best: Option<(f64, P2)> = None;
-    for w in boundary.iter().flat_map(|b| b.windows(2)) {
-        if let Some((t, u)) = seg_inter(from, p, w[0], w[1])
-            && t > 1.0
-            && (0.0..=1.0).contains(&u)
-        {
-            let s = (t - 1.0) * len;
-            if best.is_none_or(|(bs, _)| s < bs) {
-                best = Some((s, lerp(w[0], w[1], u)));
+    let mut cand = Vec::new();
+    for b in boundary {
+        let Some(bb) = b.tree.bbox() else { continue };
+        // a crossing lies in the path's box: on the ray no farther from p than its farthest
+        // corner (the sum of the offsets is more than that distance)
+        let reach = [[bb[0], bb[1]], [bb[2], bb[1]], [bb[0], bb[3]], [bb[2], bb[3]]]
+            .iter()
+            .map(|c| (c[0] - p[0]).abs() + (c[1] - p[1]).abs())
+            .fold(0.0, f64::max)
+            + 1.0;
+        let far = [p[0] + (p[0] - from[0]) / len * reach, p[1] + (p[1] - from[1]) / len * reach];
+        let q = grow([p[0].min(far[0]), p[1].min(far[1]), p[0].max(far[0]), p[1].max(far[1])], 1e-3 * (len + reach));
+        let seen = b.tree.query(q, stack, &mut cand);
+        fuel.scan(seen, cand.len() as u64)?;
+        for &k in &cand {
+            let (w0, w1) = (b.pts[k], b.pts[k + 1]);
+            if let Some((t, u)) = seg_inter(from, p, w0, w1)
+                && t > 1.0
+                && (0.0..=1.0).contains(&u)
+            {
+                let s = (t - 1.0) * len;
+                if best.is_none_or(|(bs, _)| s < bs) {
+                    best = Some((s, lerp(w0, w1, u)));
+                }
             }
         }
     }
-    best
+    Ok(best)
 }
 
 /// Trims or extends one end of the line geometry to the boundary; `true` when trimmed.
-fn trim_extend_geom(g: &Geom, boundary: &[Vec<P2>]) -> Res<(Geom, bool)> {
+fn trim_extend_geom(g: &Geom, boundary: &[Indexed], fuel: &mut Meter) -> Res<(Geom, bool)> {
     let mut parts: Vec<Vec<P2>> = g.to_multi_line().map(|m| m.0.iter().map(ring_points).collect()).unwrap_or_default();
     for p in parts.iter_mut() {
         dedup(p, DEDUP_M);
@@ -1926,8 +2302,8 @@ fn trim_extend_geom(g: &Geom, boundary: &[Vec<P2>]) -> Res<(Geom, bool)> {
     // the end nearest to the boundary, over all parts: (distance, part, at the start)
     let mut ends: Vec<(f64, usize, bool)> = Vec::new();
     for (k, p) in parts.iter().enumerate().filter(|(_, p)| p.len() >= 2) {
-        ends.push((dist_to_paths(p[0], boundary), k, true));
-        ends.push((dist_to_paths(p[p.len() - 1], boundary), k, false));
+        ends.push((dist_to_paths(p[0], boundary, fuel)?, k, true));
+        ends.push((dist_to_paths(p[p.len() - 1], boundary, fuel)?, k, false));
     }
     ends.sort_by(|a, b| a.0.total_cmp(&b.0));
     let &(d0, k, at_start) = ends.first().ok_or("the line has no segments")?;
@@ -1936,7 +2312,7 @@ fn trim_extend_geom(g: &Geom, boundary: &[Vec<P2>]) -> Res<(Geom, bool)> {
     }
     let line = parts[k].clone();
     let n = line.len();
-    let hs = hits_any(&line, boundary);
+    let hs = hits_any(&Indexed::new(&line, fuel)?, boundary, fuel)?;
     let new: Vec<P2>;
     let trimmed;
     if !hs.is_empty() {
@@ -1949,12 +2325,17 @@ fn trim_extend_geom(g: &Geom, boundary: &[Vec<P2>]) -> Res<(Geom, bool)> {
         };
         trimmed = true;
     } else {
-        let try_end = |start: bool| {
-            if start { ray_hit(line[1], line[0], boundary) } else { ray_hit(line[n - 2], line[n - 1], boundary) }
+        let mut stack = Vec::new();
+        let mut try_end = |start: bool, fuel: &mut Meter| {
+            if start {
+                ray_hit(line[1], line[0], boundary, &mut stack, fuel)
+            } else {
+                ray_hit(line[n - 2], line[n - 1], boundary, &mut stack, fuel)
+            }
         };
-        let (start, (_, p)) = match try_end(at_start) {
+        let (start, (_, p)) = match try_end(at_start, fuel)? {
             Some(r) => (at_start, r),
-            None => match try_end(!at_start) {
+            None => match try_end(!at_start, fuel)? {
                 Some(r) => (!at_start, r),
                 None => return Err("neither end points towards the boundary".into()),
             },

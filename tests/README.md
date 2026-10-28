@@ -95,13 +95,18 @@ refuses work that would not fit before it starts, with a message that says what 
   with `budget::COMMAND_FUEL` together with their own costs. Division estimates its cutting
   from each polygon's vertices and parts (`division::check_division`, also for the tool with
   `budget::TOOL_FUEL`); Offset Curve counts its work as it goes and buffers polygons by an
-  estimate (`lines::OffsetFuel`), and computes every offset before writing any.
+  estimate (`lines::OffsetFuel`), and computes every offset before writing any. Cut, Clip and
+  Split With Line charge a `budget::Meter` for snapping (`topo::Placer::snap_paths`), the
+  boolean ops and slices (`polygons::overlay_fuel` from `polygons::XRanges`), placing and
+  sharing the new vertices and the writes, all before the first write, and give topological
+  editing what is left (`topo::Scope::limit`).
 
 `test_limits.py`, `test_division.py`, `test_lines.py` and `test_attributes.py` check the
 guards on both sides of the limit. To measure a cost, the diagnostic build has `diag-bench`
-(`{"op": "proj" | "snap" | "ser" | "parse" | "write" | "read" | "divide" | "offset",
-"n": vertices, "reps": repetitions, "geometry": a GeoJSON geometry instead of the test ring,
-"parts", "distance", "pad": extra projection round trips}`): the largest `reps` that still
+(`{"op": "proj" | "snap" | "ser" | "parse" | "write" | "read" | "divide" | "offset" |
+"split" | "cut", "n": vertices, "reps": repetitions, "geometry": a GeoJSON geometry instead of
+the test ring (the tool of "split" and "cut", whose targets are "targets", with "stage":
+"snap" for snapping alone), "parts", "distance", "pad": extra projection round trips}`): the largest `reps` that still
 finishes gives the share of the budget one unit takes, and the largest `pad` with and without
 the op (`"base"`) gives what one run of it takes, to about 0.01 % of the budget.
 

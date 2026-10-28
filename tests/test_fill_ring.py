@@ -115,6 +115,43 @@ def test_nested_islands():
     check(r['created'] == 2 and r['islands'] == 3, r)
 
 
+HOLED_ISLAND = [sq(30, 30, 40), cw(sq(40, 40, 20))]
+# a locator in the outer hole only, clear of the island
+IN_OUTER_HOLE = poly(O, [(22, 22), (25, 22), (25, 25)])
+
+
+def test_holed_island_with_only_the_outer_hole_picked():
+    # the island's hole is not filled on its own, so it belongs to the outer hole's fill
+    r, before, after, restored = fill([mpoly(O, [SQ, HOLE], HOLED_ISLAND)], locators=[IN_OUTER_HOLE])
+    check_fill(r, before, after, restored, [FREE - 1600 + 400], want_parts=2)
+    # likewise with a nested island in the island's hole
+    r, before, after, restored = fill([mpoly(O, [SQ, HOLE], HOLED_ISLAND, [sq(45, 45, 10)])],
+                                      locators=[IN_OUTER_HOLE])
+    check_fill(r, before, after, restored, [FREE - 1600 + 400 - 100], want_parts=2)
+    check(r['islands'] == 2, r)
+
+
+def test_holed_island_of_another_feature():
+    # the island's hole is no hole of the selected polygon: the outer hole's fill takes it
+    r, before, after, restored = fill([poly(O, SQ, HOLE), poly(O, *HOLED_ISLAND)])
+    check_fill(r, before, after, restored, [FREE - 1600 + 400], want_parts=2)
+    # with both selected each hole is filled once, the fills side by side
+    r, before, after, restored = fill([poly(O, SQ, HOLE), poly(O, *HOLED_ISLAND)], select=(0, 1))
+    check(r['created'] == 2, r)
+    new = after[len(before):]
+    m = metric(before[0]['geometry'])
+    rep = shapely_job(geoms=[gmap(f['geometry'], m) for f in after])
+    got = sorted(rep['area'][len(before):])
+    check(all(abs(a - b) < 1e-4 for a, b in zip(got, [400.0, FREE - 1600])), got)
+    check(not [o for o in rep['overlaps'] if abs(o[2]) > 1e-6], rep['overlaps'])
+    check(vertex_set(*[f['geometry'] for f in new]) <= vertex_set(*[f['geometry'] for f in before]), 'new vertices')
+
+
+def test_holed_island_both_holes_filled_once():
+    r, before, after, restored = fill([mpoly(O, [SQ, HOLE], HOLED_ISLAND)])
+    check_fill(r, before, after, restored, [FREE - 1600, 400], want_parts=1)
+
+
 def test_islands_covering_the_hole():
     data = write_layer('parcels', [feature(poly(O, SQ, HOLE), name='p0'), feature(poly(O, sq(20, 20, 60)), name='f'),
                                    feature(poly(O, [(x + 200, y) for x, y in SQ], [(x + 200, y) for x, y in HOLE]),

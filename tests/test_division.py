@@ -475,6 +475,27 @@ def test_division_budget_allows_typical_use():
         check(r['divided'] == 2, r)
 
 
+# A 999 km square in UTM 34N (500 ± 499.5 km E, 5000 ± 499.5 km N): every edge and cut is
+# measured on the ellipsoid in some 200 pieces.
+BIG_SQUARE = polygon([[15.106289568817635, 40.504747894291], [26.89371043118235, 40.504747894291],
+                      [27.89293153563378, 49.44225766448601], [14.107068464366202, 49.44225766448601],
+                      [15.106289568817635, 40.504747894291]])
+
+
+def test_division_budget_counts_long_edges():
+    with Session(write_layer('big', [feature(BIG_SQUARE, name='big')])) as s:
+        s.activate('big')
+        s.select('big', [0])
+        before = s.features('big')
+        for parts in (1000, 83):
+            e = s.error_of('divide-equal', {'parts': parts, 'angle': 0})
+            check('Dividing 1 polygon(s) with 5 vertices into %d parts is more than one command can do' % parts in e, e)
+            check(s.features('big') == before, 'a refused division changed the data')
+        r = s.plugin('divide-equal', {'parts': 82, 'angle': 0})
+        check(r['divided'] == 1 and r['created'] == 81 and len(s.features('big')) == 82, r)
+        check(max(r['areas'][0]) - min(r['areas'][0]) <= 2e-6 * max(r['areas'][0]), r['areas'])
+
+
 # ---------- divide-parcel (tool) ----------
 
 def tool(s, **params):
@@ -617,6 +638,15 @@ def test_tool_budget():
             raise AssertionError('the tool accepted parts of 15 m²')
         except CommandError as e:
             check('more than one run of the tool can do' in str(e), str(e))
+    # long edges and cuts count too: 5 vertices into 5000 parts of a 999 km square
+    with Session(write_layer('shapes', [feature(BIG_SQUARE, name='big')])) as s:
+        try:
+            tool(s, count=5000, angle=0)
+            raise AssertionError('the tool accepted 5000 parts of a 999 km square')
+        except CommandError as e:
+            check('Dividing 1 polygon(s) with 5 vertices into about 5 000 parts is more than one run of the tool '
+                  'can do' in str(e), str(e))
+        check('shapes divided' not in s.layers(), 'a refused tool added a layer')
 
 
 # ---------- real data ----------
