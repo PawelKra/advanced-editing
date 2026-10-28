@@ -154,13 +154,21 @@ def test_locator_picks_one_of_two_holes():
 
 
 def test_layer_too_large_still_subtracts_own_parts():
-    # a far-away polygon of ~1.4 MB: the layer is not read, the feature's own island still counts
+    # A far-away polygon of ~1.4 MB: the layer is not read, so only the selected features are
+    # searched for islands. The fill then overlaps the unselected 5 x 5 polygon in the hole:
+    # that is the documented behaviour, and the message must say so plainly.
     big = {'type': 'Polygon', 'coordinates': [blob(5000, 0, 100, 35000)]}
-    r, before, after, restored = fill([mpoly(O, [SQ, HOLE], [sq(40, 40, 20)]), poly(O, sq(25, 25, 5)), big])
+    feats = [mpoly(O, [SQ, HOLE], [sq(40, 40, 20)]), poly(O, sq(25, 25, 5)), big]
+    r, before, after, restored = fill(feats)
     check(r['created'] == 1 and r['islands'] == 1 and not r['layerChecked'], r)
-    check("other polygons of 'parcels' were not checked for islands" in r['message'], r['message'])
+    check("the layer is too large to check its unselected polygons for islands: the new polygon may overlap "
+          "unselected polygons of 'parcels' lying in the hole. Select those polygons too, or undo" in r['message'],
+          r['message'])
     check(fingerprint(restored) == fingerprint(before), 'undo did not restore')
     m = metric(before[0]['geometry'])
     a = shapely_job(geoms=[gmap(after[-1]['geometry'], m)])['area'][0]
     check(abs(a - (FREE - 400)) < 1e-4, a)
-
+    # selecting the small polygon too keeps it out, as the message advises
+    r, before, after, restored = fill(feats, select=(0, 1))
+    check(r['created'] == 1 and r['islands'] == 2 and not r['layerChecked'], r)
+    check_fill(r, before, after, restored, [FREE - 425], want_holes=2)

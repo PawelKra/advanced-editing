@@ -21,7 +21,7 @@ Every command of the **Advanced Editing** ribbon tab and the **Divide Parcel** t
 - **Active layer**: the layer selected in the Layers pane.
 - **Tool features**: the selected features of the active layer (a cutter, a splitting line, a boundary).
 - **Target features**: the features a tool command edits. They are the selected features of the **other** vector layers; when no other layer has a selection, or with **Use whole active layer as targets** (`wholeLayer`), they are the features of the active layer that intersect a tool feature, the tools themselves excluded.
-- **Locators**: for Delete Ring, Fill Ring, Delete Part and Split Off Part, the features selected in other vector layers (points, lines or polygons). They limit the command to the holes or parts they intersect; without locators the command acts on all of them.
+- **Locators**: for Delete Ring, Fill Ring, Delete Part and Split Off Part, the features selected in other vector layers (points, lines or polygons). They limit the command to the holes or parts they intersect; without locators the command acts on all of them. When the selected features elsewhere all lack a geometry, the command is refused (*The selected features in 'loc' have no geometry to pick holes with; select features with a geometry or clear that selection*) rather than acting on all of them.
 - **Working frame**: all geometry work happens in metres, in EPSG:2180 when every input position lies in Poland (14.0–24.2°E, 49.0–54.9°N), otherwise in the WGS 84 UTM zone of the centre of the input's extent. Distances, areas and bearings below are in this frame unless stated otherwise ("ellipsoidal" areas are on GRS80).
 - **Bit-exact vertices**: every vertex a command writes back within 0.01 mm of an input vertex gets that vertex's original coordinates. This holds for every command below and is not repeated.
 - **Result selection**: after a successful command, the changed and new features are selected.
@@ -50,6 +50,8 @@ The **Advanced Editing** panel (the last button of the tab) holds the settings. 
 | Divide from the other side | `reverse` | on/off | off | Divide Into Equal Parts, Cut Off Percent: start on the east (or south) instead of the west (or north) |
 | Topological editing | `topological` | on/off | on | Cut, Clip, Split With Line, Divide Into Equal Parts, Cut Off Percent |
 | Use whole active layer as targets | `wholeLayer` | on/off | off | see below |
+
+**New features inherit attributes** from the feature they are made from (Fill Ring, Split Off Part, Split With Line, Offset Curve, Copy/Move, Divide Into Equal Parts, Cut Off Percent, Divide Parcel), except the identifier fields `id`, `fid` and `ogc_fid` (any case), which would repeat a unique key: the provider assigns new ones or leaves them empty.
 
 **Use whole active layer as targets** has two meanings. For Delete Ring, Fill Ring, Fill Gap, Simplify, Densify and Smooth it edits every feature of the active layer instead of its selection. For Cut, Clip, Add Ring, Add Part, Split With Line, Reshape and Trim/Extend it takes the targets from the active layer even when other layers have a selection.
 
@@ -82,7 +84,7 @@ Budget refusals (see [Limits](../README.md#limits)):
 - *This would edit 812 features with 61 000 vertices; one command handles about 20 000 vertices. Select fewer features and repeat the command for the rest.*
 - *The result would be … features with about … vertices; one command writes about 41 000 vertices. Select fewer features or use a coarser setting, and repeat the command for the rest.*
 
-Frame refusals: *the features span 30.0° of longitude; metric editing needs them within 20°*, *features beyond ±84° latitude are not supported*.
+Frame refusals: *the features span 30.0° of longitude; metric editing needs them within 20°*, *features beyond ±84° latitude are not supported*. Longitude is measured the short way round, so features across the antimeridian (179.9° to -179.9°) span 0.2°; new vertices come back within -180° to 180°.
 
 **Topological editing note.** Commands that place new vertices on original edges (Cut, Clip, Split With Line, the division commands) append to their message *; added N shared vertices to M neighbouring feature(s)* and, for a layer too large to search, *; shared vertices not added in '…': the layer is too large to read in the same command (select fewer features or turn off Topological editing)*. In a message that is a sentence, the note goes before the full stop.
 
@@ -111,7 +113,7 @@ Frame refusals: *the features span 30.0° of longitude; metric editing needs the
 **Refusal.** *Select the cutting polygon(s) in the active layer and the polygons to cut in another layer. (the cutting polygons do not overlap the targets)*
 
 ```sh
-rustgis-cli run --plugin advanced-editing-0.1.0.rgplugin --data parcels.gpkg --data cutter.geojson \
+rustgis-cli run --plugin advanced-editing-0.1.1.rgplugin --data parcels.gpkg --data cutter.geojson \
   --cmd 'select.rows={"layer":"parcels","rows":[0,1]}' \
   --cmd 'layer.select={"layer":"cutter"}' \
   --cmd 'select.rows={"layer":"cutter","rows":[0],"mode":"add"}' \
@@ -130,7 +132,7 @@ Same selection, settings, snapping and topology as [Cut With Polygon](#cut-with-
 - **Refusal**: *Select the clipping polygon(s) in the active layer and the polygons to clip in another layer. (every target already lies inside the clipping polygons)*
 
 ```sh
-rustgis-cli run --plugin advanced-editing-0.1.0.rgplugin --data parcels.gpkg --data area.geojson \
+rustgis-cli run --plugin advanced-editing-0.1.1.rgplugin --data parcels.gpkg --data area.geojson \
   --cmd 'select.rows={"layer":"parcels","rows":[0,1,2]}' \
   --cmd 'layer.select={"layer":"area"}' \
   --cmd 'select.rows={"layer":"area","rows":[0],"mode":"add"}' \
@@ -156,7 +158,7 @@ rustgis-cli run --plugin advanced-editing-0.1.0.rgplugin --data parcels.gpkg --d
 **Refusal.** *Select the polygon(s) to make holes of in the active layer and the polygons around them in another layer. (no tool polygon lies inside a target: 1 outside, 0 crossing, overlapping or running along a target's outline or holes)*
 
 ```sh
-rustgis-cli run --plugin advanced-editing-0.1.0.rgplugin --data parcels.gpkg --data holes.geojson \
+rustgis-cli run --plugin advanced-editing-0.1.1.rgplugin --data parcels.gpkg --data holes.geojson \
   --cmd 'select.rows={"layer":"parcels","rows":[3]}' \
   --cmd 'layer.select={"layer":"holes"}' \
   --cmd 'select.rows={"layer":"holes","rows":[0],"mode":"add"}' \
@@ -179,7 +181,7 @@ rustgis-cli run --plugin advanced-editing-0.1.0.rgplugin --data parcels.gpkg --d
 **Refusals.** *Select the polygons whose holes to delete in the active layer (optionally points or polygons in another layer to pick the holes). (the 3 selected polygon(s) have no holes)*; with locators: *(none of the holes of the 3 selected polygon(s) touch the selected features of the other layers)*.
 
 ```sh
-rustgis-cli run --plugin advanced-editing-0.1.0.rgplugin --data parcels.gpkg \
+rustgis-cli run --plugin advanced-editing-0.1.1.rgplugin --data parcels.gpkg \
   --cmd 'layer.select={"layer":"parcels"}' \
   --cmd 'select.rows={"layer":"parcels","rows":[3]}' \
   --cmd 'plugin:advanced-editing/delete-ring'
@@ -195,20 +197,20 @@ rustgis-cli run --plugin advanced-editing-0.1.0.rgplugin --data parcels.gpkg \
 | Locators | Optional: only the holes they intersect are filled. |
 | Settings | `wholeLayer` |
 | Created | One polygon per filled hole. |
-| Attributes | The new polygon copies the attributes of the polygon around the hole, except `id` and `fid`. |
+| Attributes | The new polygon copies the attributes of the polygon around the hole, except `id`, `fid` and `ogc_fid`. |
 
-**Islands.** Polygons lying inside the hole stay out of the new polygon: other parts of the same feature and other polygons of the active layer (read whole when it fits the command's budget). An island touching the hole's ring is joined to it exactly (its vertex is inserted into the ring). A hole that islands cover entirely is not filled.
+**Islands.** Polygons lying inside the hole stay out of the new polygon: other parts of the same feature and other polygons of the active layer (read whole when it fits the command's budget). When the layer is too large to read, only the selected polygons are checked: an unselected polygon lying in the hole is then not left out and the new polygon overlaps it; the message says so. Select such polygons too (they are then left out), or undo. An island touching the hole's ring is joined to it exactly (its vertex is inserted into the ring). A hole that islands cover entirely is not filled.
 
 ![Left: a square polygon with a square hole and a smaller island polygon inside the hole. Right: a new polygon fills the hole around the island](images/fill-ring.png)
 
 *Fill Ring with an island: 100² − 40² = 8 400 m².*
 
-**Message.** *Filled 1 hole(s) with new polygons; 1 island(s) left out of them*, and, when the layer is too large to search, *; other polygons of '…' were not checked for islands: the layer is too large to read in the same command (select fewer features)*.
+**Message.** *Filled 1 hole(s) with new polygons; 1 island(s) left out of them*, and, when the layer is too large to search, *; the layer is too large to check its unselected polygons for islands: the new polygon may overlap unselected polygons of '…' lying in the hole. Select those polygons too, or undo*.
 
 **Refusals.** *Select the polygons whose holes to fill in the active layer (optionally points or polygons in another layer to pick the holes). (the 1 selected polygon(s) have no holes)*; *(islands cover each of the 1 hole(s) entirely)*.
 
 ```sh
-rustgis-cli run --plugin advanced-editing-0.1.0.rgplugin --data parcels.gpkg \
+rustgis-cli run --plugin advanced-editing-0.1.1.rgplugin --data parcels.gpkg \
   --cmd 'layer.select={"layer":"parcels"}' \
   --cmd 'select.rows={"layer":"parcels","rows":[3]}' \
   --cmd 'plugin:advanced-editing/fill-ring'
@@ -233,7 +235,7 @@ rustgis-cli run --plugin advanced-editing-0.1.0.rgplugin --data parcels.gpkg \
 **Refusal.** *Select the polygon(s) to add as parts in the active layer and the one polygon to add them to in another layer. (2 target polygons, the parts go to exactly one)*
 
 ```sh
-rustgis-cli run --plugin advanced-editing-0.1.0.rgplugin --data parcels.gpkg --data parts.geojson \
+rustgis-cli run --plugin advanced-editing-0.1.1.rgplugin --data parcels.gpkg --data parts.geojson \
   --cmd 'select.rows={"layer":"parcels","rows":[3]}' \
   --cmd 'layer.select={"layer":"parts"}' \
   --cmd 'select.rows={"layer":"parts","rows":[0],"mode":"add"}' \
@@ -258,7 +260,7 @@ rustgis-cli run --plugin advanced-editing-0.1.0.rgplugin --data parcels.gpkg --d
 **Refusals.** *Select multi-part polygons in the active layer (optionally points or polygons in another layer to pick the parts to delete). (none of the 2 selected polygon(s) has more than one part)*; *(the locators touch every part of 1 feature(s); delete the feature instead)*.
 
 ```sh
-rustgis-cli run --plugin advanced-editing-0.1.0.rgplugin --data parcels.gpkg \
+rustgis-cli run --plugin advanced-editing-0.1.1.rgplugin --data parcels.gpkg \
   --cmd 'layer.select={"layer":"parcels"}' \
   --cmd 'select.rows={"layer":"parcels","rows":[7]}' \
   --cmd 'plugin:advanced-editing/delete-part'
@@ -268,14 +270,14 @@ rustgis-cli run --plugin advanced-editing-0.1.0.rgplugin --data parcels.gpkg \
 
 `split-off-part` — moves parts of the selected multi-part polygons into new features.
 
-As [Delete Part](#delete-part), but the picked parts become new features with the original's attributes (except `id` and `fid`). When the locators pick every part, the largest stays in the original feature.
+As [Delete Part](#delete-part), but the picked parts become new features with the original's attributes (except `id`, `fid` and `ogc_fid`). When the locators pick every part, the largest stays in the original feature.
 
 **Message.** *Split 2 part(s) off 1 polygon(s) into new features*
 
 **Refusal.** *Select multi-part polygons in the active layer (optionally points or polygons in another layer to pick the parts to split off). (none of the 2 selected polygon(s) has more than one part)*
 
 ```sh
-rustgis-cli run --plugin advanced-editing-0.1.0.rgplugin --data parcels.gpkg \
+rustgis-cli run --plugin advanced-editing-0.1.1.rgplugin --data parcels.gpkg \
   --cmd 'layer.select={"layer":"parcels"}' \
   --cmd 'select.rows={"layer":"parcels","rows":[7]}' \
   --cmd 'plugin:advanced-editing/split-off-part'
@@ -300,7 +302,7 @@ rustgis-cli run --plugin advanced-editing-0.1.0.rgplugin --data parcels.gpkg \
 **Refusal.** *Select the polygons around the gaps in the active layer. (no enclosed gap between the 4 polygons; gaps open to the outside are not filled, 1 sliver(s) ignored)*
 
 ```sh
-rustgis-cli run --plugin advanced-editing-0.1.0.rgplugin --data parcels.gpkg \
+rustgis-cli run --plugin advanced-editing-0.1.1.rgplugin --data parcels.gpkg \
   --cmd 'layer.select={"layer":"parcels"}' \
   --cmd 'plugin:advanced-editing/fill-gap={"wholeLayer":true}'
 ```
@@ -319,7 +321,7 @@ rustgis-cli run --plugin advanced-editing-0.1.0.rgplugin --data parcels.gpkg \
 | Target features | Polygons or lines: the selection in other layers, or the active layer's features the lines touch. |
 | Settings | `keepTools`, `wholeLayer`, `topological` |
 | Changed | Each split target keeps its largest piece (by area, or length for lines) together with the parts of a multi-part feature that no line splits. |
-| Created | Every other piece, as a new feature with the target's attributes. |
+| Created | Every other piece, as a new feature with the target's attributes except `id`, `fid` and `ogc_fid`. |
 | Deleted | The tools, when Keep tool features is off. |
 
 **Polygons.** A target is split where a line crosses it from side to side; several lines, crossing lines, zigzags and self-crossing lines all cut together, and the pieces are exactly the faces the lines and the boundary enclose. A closed line inside a polygon cuts out the area it encloses. A line that only touches the boundary or ends inside the polygon (tangent or dangling) does not split it. Tool vertices and edges within 1 mm of a target's vertices or edges are snapped onto them, so a line drawn along an edge splits nothing there, and an end on the boundary counts as crossing it. Pieces under 1 cm² are dropped. As a safety check, if the pieces' total area differs from the original by more than 1e-6 of it plus 1e-4 m², the command refuses: *splitting changed the area from … m² to … m²; nothing was split*.
@@ -335,7 +337,7 @@ rustgis-cli run --plugin advanced-editing-0.1.0.rgplugin --data parcels.gpkg \
 **Refusal.** *Select the splitting line(s) in the active layer and the polygons or lines to split in another layer. (the line does not cross any of the 3 target feature(s) from side to side)*
 
 ```sh
-rustgis-cli run --plugin advanced-editing-0.1.0.rgplugin --data parcels.gpkg --data cuts.geojson \
+rustgis-cli run --plugin advanced-editing-0.1.1.rgplugin --data parcels.gpkg --data cuts.geojson \
   --cmd 'select.rows={"layer":"parcels","rows":[0,1,2,3]}' \
   --cmd 'layer.select={"layer":"cuts"}' \
   --cmd 'select.rows={"layer":"cuts","rows":[0,1],"mode":"add"}' \
@@ -380,7 +382,7 @@ rustgis-cli run --plugin advanced-editing-0.1.0.rgplugin --data parcels.gpkg --d
 | *the reshaping line must be a single line with at least two positions* | multi-part tool |
 
 ```sh
-rustgis-cli run --plugin advanced-editing-0.1.0.rgplugin --data parcels.gpkg --data sketch.geojson \
+rustgis-cli run --plugin advanced-editing-0.1.1.rgplugin --data parcels.gpkg --data sketch.geojson \
   --cmd 'select.rows={"layer":"parcels","rows":[5]}' \
   --cmd 'layer.select={"layer":"sketch"}' \
   --cmd 'select.rows={"layer":"sketch","rows":[0],"mode":"add"}' \
@@ -395,7 +397,7 @@ rustgis-cli run --plugin advanced-editing-0.1.0.rgplugin --data parcels.gpkg --d
 |---|---|
 | Edited features | Selected lines or polygons of the active layer. |
 | Settings | `distance` (m), `left`, `move` |
-| Created | One offset copy per feature, with the same attributes (default). |
+| Created | One offset copy per feature, with the same attributes except `id`, `fid` and `ogc_fid` (default). |
 | Changed | With Move instead of copy, the original's geometry is replaced instead. |
 
 **Lines** get a one-sided offset curve, to the right of their direction (to the left with `left`), built much as GEOS builds it: every segment shifted, corners on the offset side rounded (chords at most 0.1 rad apart, so up to 0.13 % nearer than the distance), the other corners trimmed, and the loops and cusps that appear where the distance exceeds the curvature or the line comes back near itself removed. Where the line passes within the distance of itself the offset is cut apart (a MultiLineString). The jitter of densely digitised lines is left out where that moves the offset by less than 0.004 % of the distance.
@@ -409,7 +411,7 @@ rustgis-cli run --plugin advanced-editing-0.1.0.rgplugin --data parcels.gpkg --d
 **Refusals.** After *Select the lines or polygons to offset in the active layer.*: *(nothing is left at 50 m: the distance is larger than the selected features allow)*; *(offsetting these lines by 20 m is more than one command can do; select fewer features, simplify them or use a smaller distance)*; *(the offsets have 52 000 vertices, more than one command can write after computing them; select fewer features and repeat the command for the rest)*. All offsets are computed before the first write.
 
 ```sh
-rustgis-cli run --plugin advanced-editing-0.1.0.rgplugin --data roads.gpkg \
+rustgis-cli run --plugin advanced-editing-0.1.1.rgplugin --data roads.gpkg \
   --cmd 'layer.select={"layer":"roads"}' \
   --cmd 'select.rows={"layer":"roads","rows":[0]}' \
   --cmd 'plugin:advanced-editing/offset={"distance":10,"left":false}'
@@ -435,7 +437,7 @@ rustgis-cli run --plugin advanced-editing-0.1.0.rgplugin --data roads.gpkg \
 **Refusals.** Per-target reasons: *the line already meets the boundary*, *neither end points towards the boundary*, *nothing would be left of the line*. Selection: *No line of the active layer crosses the boundary or ends within 1 m of it. Select the lines to trim or extend in another layer, or raise Distance.*; with a polygon active layer and no lines selected elsewhere: *Select one boundary line (or polygon) in the active layer and the lines to trim or extend in another layer. (no lines are selected in another layer)*.
 
 ```sh
-rustgis-cli run --plugin advanced-editing-0.1.0.rgplugin --data lines.gpkg --data boundary.geojson \
+rustgis-cli run --plugin advanced-editing-0.1.1.rgplugin --data lines.gpkg --data boundary.geojson \
   --cmd 'select.rows={"layer":"lines","rows":[0,1]}' \
   --cmd 'layer.select={"layer":"boundary"}' \
   --cmd 'select.rows={"layer":"boundary","rows":[0],"mode":"add"}' \
@@ -457,16 +459,16 @@ rustgis-cli run --plugin advanced-editing-0.1.0.rgplugin --data lines.gpkg --dat
 | Changed | The kept feature: the largest by area (polygons) or length (lines); sizes within 1 ppm count as equal and the lowest id wins; for points the lowest id. It keeps its id and attributes and gets the merged geometry. |
 | Deleted | The other merged features. |
 
-**Geometry.** Polygons are unioned. Lines that run over each other are dissolved, so a shared stretch is kept once (within 0.1 mm), then joined where their ends meet. Points become a MultiPoint.
+**Geometry.** Polygons are unioned. Lines that run over each other are dissolved, so a shared stretch is kept once (within 0.1 mm), then joined where exactly two of their ends meet (as GEOS's line merge); where three or more ends meet, the lines stay apart. Points become a MultiPoint.
 
 **Summing.** With `sum`, each numeric field (integer, real, double, float, decimal, numeric) except `id`, `fid` and `ogc_fid` gets the sum over the merged features. Nulls count as 0 next to at least one value; a field null in all of them stays null; an integer field's sum stays an integer unless it overflows.
 
 **Message.** *Merged 2 features into feature 4, which keeps its attributes (the longest). Summed 1 numeric field.*
 
-**Refusals.** *Select two or more features of the active layer to merge. (1 line feature(s) to work on in the active layer '…')*; *(feature 7 is not a polygon like the layer '…')*.
+**Refusals.** *Select two or more features of the active layer to merge. (1 line feature(s) to work on in the active layer '…')*; *(feature 7 is not a polygon like the layer '…')*; *Merging these 3 000 lines means comparing 4 498 500 pairs of segments, and is more than one command can do. Select fewer lines and merge them in steps.* (see [Limits](../README.md#limits)).
 
 ```sh
-rustgis-cli run --plugin advanced-editing-0.1.0.rgplugin --data roads.gpkg \
+rustgis-cli run --plugin advanced-editing-0.1.1.rgplugin --data roads.gpkg \
   --cmd 'layer.select={"layer":"roads"}' \
   --cmd 'select.rows={"layer":"roads","rows":[0,1]}' \
   --cmd 'plugin:advanced-editing/merge-with-attributes={"sum":true}'
@@ -487,7 +489,7 @@ rustgis-cli run --plugin advanced-editing-0.1.0.rgplugin --data roads.gpkg \
 **Refusals.** *Select exactly two features of the active layer to swap their attributes. (3 polygon feature(s) to work on in the active layer '…')*; *(the layer '…' has no fields)*. Features in two different layers cannot be exchanged.
 
 ```sh
-rustgis-cli run --plugin advanced-editing-0.1.0.rgplugin --data parcels.gpkg \
+rustgis-cli run --plugin advanced-editing-0.1.1.rgplugin --data parcels.gpkg \
   --cmd 'layer.select={"layer":"parcels"}' \
   --cmd 'select.rows={"layer":"parcels","rows":[3,8]}' \
   --cmd 'plugin:advanced-editing/exchange-attributes'
@@ -501,7 +503,7 @@ rustgis-cli run --plugin advanced-editing-0.1.0.rgplugin --data parcels.gpkg \
 |---|---|
 | Edited features | Selected features of the active layer (points, lines or polygons). |
 | Settings | `distance` (m), `bearing` (° clockwise from grid north), `move` |
-| Created | A shifted copy of each feature with its field values (default). |
+| Created | A shifted copy of each feature with its field values except `id`, `fid` and `ogc_fid` (default). |
 | Changed | With Move instead of copy, the features themselves are shifted. |
 
 The shift is applied in the working frame, so the bearing is a grid bearing of EPSG:2180 (UTM outside Poland), not geographic north.
@@ -509,7 +511,7 @@ The shift is applied in the working frame, so the bearing is a grid bearing of E
 **Message.** *Copied 2 features by 10 m towards 90°.*
 
 ```sh
-rustgis-cli run --plugin advanced-editing-0.1.0.rgplugin --data parcels.gpkg \
+rustgis-cli run --plugin advanced-editing-0.1.1.rgplugin --data parcels.gpkg \
   --cmd 'layer.select={"layer":"parcels"}' \
   --cmd 'select.rows={"layer":"parcels","rows":[0]}' \
   --cmd 'plugin:advanced-editing/copy-move={"distance":25,"bearing":180,"move":true}'
@@ -530,7 +532,7 @@ rustgis-cli run --plugin advanced-editing-0.1.0.rgplugin --data parcels.gpkg \
 **Message.** *Simplified 3 features (tolerance 0.5 m; 412 → 160 vertices). 1 feature needed no change. Left unchanged, would collapse: 17. Each feature was edited on its own: boundaries shared with neighbours can now leave gaps or overlaps.*
 
 ```sh
-rustgis-cli run --plugin advanced-editing-0.1.0.rgplugin --data parcels.gpkg \
+rustgis-cli run --plugin advanced-editing-0.1.1.rgplugin --data parcels.gpkg \
   --cmd 'layer.select={"layer":"parcels"}' \
   --cmd 'select.rows={"layer":"parcels","rows":[0,1,2]}' \
   --cmd 'plugin:advanced-editing/simplify={"tolerance":0.5}'
@@ -551,7 +553,7 @@ The expected output is checked against the write budget (about 40 000 new vertic
 **Message.** *Densified 1 feature (at most 5 m between vertices; 5 → 81 vertices).*
 
 ```sh
-rustgis-cli run --plugin advanced-editing-0.1.0.rgplugin --data roads.gpkg \
+rustgis-cli run --plugin advanced-editing-0.1.1.rgplugin --data roads.gpkg \
   --cmd 'layer.select={"layer":"roads"}' \
   --cmd 'select.rows={"layer":"roads","rows":[0]}' \
   --cmd 'plugin:advanced-editing/densify={"distance":5}'
@@ -572,7 +574,7 @@ Each pass roughly doubles the vertices. Line ends stay in place; polygon rings s
 **Message.** *Smoothed 2 features (2 iterations; 40 → 160 vertices).*
 
 ```sh
-rustgis-cli run --plugin advanced-editing-0.1.0.rgplugin --data roads.gpkg \
+rustgis-cli run --plugin advanced-editing-0.1.1.rgplugin --data roads.gpkg \
   --cmd 'layer.select={"layer":"roads"}' \
   --cmd 'select.rows={"layer":"roads","rows":[0]}' \
   --cmd 'plugin:advanced-editing/smooth={"iterations":3}'
@@ -582,7 +584,7 @@ rustgis-cli run --plugin advanced-editing-0.1.0.rgplugin --data roads.gpkg \
 
 # Division
 
-All division commands cut with parallel straight lines at a grid bearing of the working frame (0° = north–south lines, 90° = east–west lines) and number the parts from the left of the line direction (from the west with 0°, from the north with 90°); `reverse` starts from the other side. Areas are ellipsoidal (GRS80) and each part is accurate to 0.01 m² or 1 ppm of the part, whichever is larger. A part made of several pieces (a cut through a concave or multi-part parcel) is one MultiPolygon feature. See [Parcel division](../README.md#parcel-division) for the method.
+All division commands cut with parallel straight lines at a grid bearing of the working frame (0° = north–south lines, 90° = east–west lines) and number the parts from the left of the line direction (from the west with 0°, from the north with 90°); `reverse` starts from the other side. Areas are ellipsoidal (GRS80) and each part is accurate to 0.01 m² or 1 ppm of the part, whichever is larger, on parcels up to 1000 km across (the side of their bounding box in the working frame); larger parcels are refused. The reported areas and largest error are measured on each finished part independently of the model that placed the cuts. A part made of several pieces (a cut through a concave or multi-part parcel) is one MultiPolygon feature. See [Parcel division](../README.md#parcel-division) for the method.
 
 ## Divide Into Equal Parts
 
@@ -605,10 +607,11 @@ New vertices lie exactly on the polygon's edges; parts share bit-identical verti
 
 - *The number of parts must be a whole number from 2 to 1000, not 1* (script `parts` out of range or fractional)
 - *Select the polygons to divide in the active layer. (feature 12: the polygon has no area)*; *(feature 12: the cut misses it)*
+- *(feature 12: the parcel is 1070 km across in UTM 35N; ellipsoidal areas are guaranteed to 1 ppm on parcels up to 1000 km. Split it first, or divide it with the Divide Parcel tool and areaMode "Planar" (areas in the frame's plane))*
 - *Dividing 250 polygon(s) with 9 000 vertices into 4 parts is more than one command can do. Select fewer polygons, or use the Divide Parcel tool (it handles whole layers).*
 
 ```sh
-rustgis-cli run --plugin advanced-editing-0.1.0.rgplugin --data parcels.gpkg \
+rustgis-cli run --plugin advanced-editing-0.1.1.rgplugin --data parcels.gpkg \
   --cmd 'layer.select={"layer":"parcels"}' \
   --cmd 'select.rows={"layer":"parcels","rows":[4]}' \
   --cmd 'plugin:advanced-editing/divide-equal={"parts":5,"angle":30}'
@@ -632,7 +635,7 @@ rustgis-cli run --plugin advanced-editing-0.1.0.rgplugin --data parcels.gpkg \
 **Refusals.** *The cut-off share must be a percent greater than 0 and less than 100, not 0*; otherwise as Divide Into Equal Parts.
 
 ```sh
-rustgis-cli run --plugin advanced-editing-0.1.0.rgplugin --data parcels.gpkg \
+rustgis-cli run --plugin advanced-editing-0.1.1.rgplugin --data parcels.gpkg \
   --cmd 'layer.select={"layer":"parcels"}' \
   --cmd 'select.rows={"layer":"parcels","rows":[4]}' \
   --cmd 'plugin:advanced-editing/divide-percent={"percent":30,"angle":0,"reverse":true}'
@@ -650,19 +653,19 @@ rustgis-cli run --plugin advanced-editing-0.1.0.rgplugin --data parcels.gpkg \
 | `area` | Area (m²) | number | 1000 | Parts of given area: the area of each part; the remainder is the last part. |
 | `width` | Width (m) | number | 20 | Strips of given width: measured across the lines, on the ground with Ellipsoidal area, in the plane with Planar; the remainder is the last strip. |
 | `angle` | Direction (°) | number | 0 | Grid bearing of the division lines; taken modulo 180. |
-| `areaMode` | Area | `Ellipsoidal` / `Planar` | `Ellipsoidal` | Ellipsoidal: on GRS80 (cadastral). Planar: in the EPSG:2180 / UTM plane. |
+| `areaMode` | Area | `Ellipsoidal` / `Planar` | `Ellipsoidal` | Ellipsoidal: on GRS80 (cadastral), parcels up to 1000 km across. Planar: in the EPSG:2180 / UTM plane, any size. |
 | `reverse` | Start from the other side | bool | false | Number the parts (and put the remainder) from the east or south. |
 
-**Output.** A new layer *&lt;input&gt; divided* with one feature per part: the source's attributes plus `src_id` (the source feature's id, or its index), `part` (1, 2, … along the sweep) and `area_m2` (per the area mode, rounded to 0.0001 m²); these three override source fields of the same names. With *Parts of given area*, a remainder within the area tolerance is not a part of its own.
+**Output.** A new layer *&lt;input&gt; divided* with one feature per part: the source's attributes (except `id`, `fid` and `ogc_fid`) plus `src_id` (the source feature's id, or its index), `part` (1, 2, … along the sweep) and `area_m2` (per the area mode, rounded to 0.0001 m²); these three override source fields of the same names. With *Parts of given area*, a remainder within the area tolerance is not a part of its own.
 
 **Messages.** A summary, *Divided 12 of 12 parcels into 57 parts (ellipsoidal area, largest error 0.0003 m²).*, then one line per parcel (up to 150): *Parcel 405: 5 parts, 2696.62, … m².* A parcel that cannot be divided is skipped with its reason: *Parcel 17 skipped: the parcel (812.40 m²) is not larger than one part (1000.00 m²).*
 
-**Per-parcel reasons**: *the parcel (… m²) is not larger than one part (… m²)*, *… m² would give more than 10000 parts*, *… m strips would give more than 10000 parts*, *the parcel is only … m wide across the lines*, *the polygon has no area*.
+**Per-parcel reasons**: *the parcel (… m²) is not larger than one part (… m²)*, *… m² would give more than 10000 parts*, *… m strips would give more than 10000 parts*, *the parcel is only … m wide across the lines*, *the polygon has no area*, *the parcel is … km across in …; ellipsoidal areas are guaranteed to 1 ppm on parcels up to 1000 km. Split it first, or divide it with the Divide Parcel tool and areaMode "Planar" (areas in the frame's plane)*.
 
 **Refusals**: *Count must be a whole number from 2 to 10000, not 1*; *Area must be positive, not 0*; *Width must be positive, not -5*; *'area' is required for the division 'parts of given area'*; *unknown division '…'*; *unknown area mode '…'*; *Nothing to divide in 'parcels': …* (no part at all); the budget check *Dividing … polygon(s) with … vertices into about … parts is more than one run of the tool can do. Select fewer polygons or ask for fewer parts.* The tool runs with 60 times a command's budget.
 
 ```sh
-rustgis-cli run --plugin advanced-editing-0.1.0.rgplugin --data parcels.gpkg \
+rustgis-cli run --plugin advanced-editing-0.1.1.rgplugin --data parcels.gpkg \
   --cmd 'gp.run={"tool":"plugin:advanced-editing/divide-parcel","params":{"input":"parcels","mode":"Strips of given width","width":25,"angle":90,"areaMode":"Ellipsoidal","reverse":false}}'
 ```
 

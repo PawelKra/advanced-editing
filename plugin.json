@@ -1,7 +1,7 @@
 {
   "id": "advanced-editing",
   "name": "Advanced Editing",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "QGIS-style advanced editing: cut, clip and split with polygons and lines, rings and parts, reshape, offset curves, trim and extend, merge and exchange attributes, simplify, densify, smooth, and parcel division by area. Commands work on the selection: the selected features of the active layer are the tools, the selected features of other layers the targets.",
   "author": "Pawel Krapiec",
   "homepage": "https://github.com/PawelKra/advanced-editing",
@@ -42,7 +42,7 @@
     {
       "id": "fill-ring",
       "label": "Fill Ring",
-      "help": "Fills the holes of the selected polygons of the active layer (of all its polygons with \"Use whole active layer as targets\") with new polygons that copy the attributes of the polygon around them; the holes stay. Islands lying in a hole (other parts of the same feature, other polygons of the layer) stay out of the new polygon; a hole that islands cover entirely is not filled. Selected features (points, lines or polygons) in other layers limit it to the holes they touch.",
+      "help": "Fills the holes of the selected polygons of the active layer (of all its polygons with \"Use whole active layer as targets\") with new polygons that copy the attributes of the polygon around them; the holes stay. Islands lying in a hole (other parts of the same feature, other polygons of the layer) stay out of the new polygon; a hole that islands cover entirely is not filled. When the layer is too large to read, only the selected polygons are checked for islands and the message warns that the new polygon may overlap unselected ones: select them too, or undo. Selected features (points, lines or polygons) in other layers limit it to the holes they touch.",
       "icon": "polygon_layer",
       "params": "{\"wholeLayer\"?: bool} (input: the selection)"
     },
@@ -149,14 +149,14 @@
       "label": "Divide Into\nEqual Parts",
       "help": "Divides each selected polygon of the active layer into the panel's Parts number of parts of equal ellipsoidal area, with parallel cut lines in the panel's Division direction (a grid bearing of EPSG:2180 (UTM outside Poland), not geographic north). The first part keeps the feature, the others become new features with its attributes. Parts are numbered from the west (0°) or north (90°); with \"Divide from the other side\" from the east or south. A script's parts outside 2–1000 or not a whole number are refused. New vertices lie exactly on the polygon's edges; with \"Topological editing\" they are also added to the features that share those edges.",
       "icon": "measure_area",
-      "params": "{\"parts\"?: whole number 2–1000, \"angle\"?: degrees clockwise from grid north, \"reverse\"?: bool} (input: the selection)"
+      "params": "{\"parts\"?: whole number 2–1000, \"angle\"?: degrees clockwise from grid north, \"reverse\"?: bool, \"topological\"?: bool} (input: the selection)"
     },
     {
       "id": "divide-percent",
       "label": "Cut Off\nPercent",
       "help": "Cuts the panel's Cut-off share (percent of the ellipsoidal area) off each selected polygon of the active layer with a line in the panel's Division direction (a grid bearing of EPSG:2180 (UTM outside Poland), not geographic north), as a new feature with the original's attributes; the rest keeps the feature. The cut-off share is on the west (0°) or north (90°) side; with \"Divide from the other side\" on the east or south. A script's percent of 0 or less, or 100 or more, is refused. New vertices lie exactly on the polygon's edges; with \"Topological editing\" they are also added to the features that share those edges.",
       "icon": "measure_area",
-      "params": "{\"percent\"?: number greater than 0 and less than 100, fractions allowed, \"angle\"?: degrees clockwise from grid north, \"reverse\"?: bool} (input: the selection)"
+      "params": "{\"percent\"?: number greater than 0 and less than 100, fractions allowed, \"angle\"?: degrees clockwise from grid north, \"reverse\"?: bool, \"topological\"?: bool} (input: the selection)"
     },
     {
       "id": "panel-state",

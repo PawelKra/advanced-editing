@@ -277,7 +277,7 @@ fn settings(req: &Request) -> Value {
     json!({"distance": s.distance_m, "tolerance": s.tolerance_m, "iterations": s.iterations, "parts": s.parts,
         "percent": s.percent, "angle": s.angle_deg, "bearing": s.bearing_deg, "keepTools": s.keep_tools,
         "left": s.offset_left, "wholeLayer": s.whole_layer, "move": s.move_original, "sum": s.sum_numbers,
-        "reverse": s.reverse, "paramsNull": req.params.is_null()})
+        "reverse": s.reverse, "topological": s.topological, "paramsNull": req.params.is_null()})
 }
 
 fn layers() -> Res<Value> {
@@ -382,6 +382,17 @@ fn bench(p: &Value) -> Res<Value> {
             for _ in 0..reps {
                 let mut fuel = crate::lines::OffsetFuel { left: u64::MAX / 2 };
                 crate::lines::offset_geom(&m, d, false, &mut fuel)?;
+                acc = (u64::MAX / 2 - fuel.left) as f64;
+            }
+        }
+        // dissolving and joining lines (the parts of a line or multi-line) as Merge With
+        // Attributes does, without reading or writing; `acc` is the fuel it was estimated to take
+        "merge" => {
+            let m = Frame::for_geoms([&g])?.project(&g);
+            let parts: Vec<Vec<geo::Coord<f64>>> = m.to_multi_line().ok_or("lines needed")?.0.into_iter().map(|l| l.0).collect();
+            for _ in 0..reps {
+                let mut fuel = crate::attributes::MergeFuel::new(u64::MAX / 2);
+                crate::attributes::merge_metric_lines(parts.clone(), &mut fuel)?;
                 acc = (u64::MAX / 2 - fuel.left) as f64;
             }
         }

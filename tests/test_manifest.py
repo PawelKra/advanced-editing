@@ -83,3 +83,62 @@ def test_tool_params_match_the_code():
     for p in tool['params']:
         if p['kind'] == 'choice':
             check(p.get('default') in p['choices'], 'default of %s' % p['name'])
+
+
+def setting_keys():
+    """Settings field -> the script parameter that overrides it (from Settings::from_request)."""
+    body = src('lib.rs').split('pub fn from_request', 1)[1].split('\n    }\n}', 1)[0]
+    keys = dict((f, k) for k, f in re.findall(r'req\.f64\("([A-Za-z]+)"\)[^\n]*\{\s*s\.([a-z_]+) =', body))
+    keys.update((f, k) for k, f in re.findall(r'\("([A-Za-z]+)", &mut s\.([a-z_]+)\)', body))
+    return keys
+
+
+def functions():
+    """Every `fn` of src/*.rs by module::name, as (signature, body) (brace-matched)."""
+    out = {}
+    for f in (REPO / 'src').glob('*.rs'):
+        text = f.read_text()
+        for m in re.finditer(r'\bfn ([a-z_0-9]+)\b[^{;]*\{', text):
+            depth, i = 1, m.end()
+            while depth and i < len(text):
+                depth += {'{': 1, '}': -1}.get(text[i], 0)
+                i += 1
+            out.setdefault('%s::%s' % (f.stem, m.group(1)), []).append((m.group(0), text[m.end():i]))
+    return out
+
+
+def test_every_command_documents_the_params_it_reads():
+    """Per command: the script parameters its code reads (its settings and direct `req` reads,
+    followed through the functions taking a `&Ctx` it calls) appear in its params text."""
+    keys = setting_keys()
+    check(len(keys) >= 10, keys)
+    fns = functions()
+    table = src('lib.rs').split('pub const COMMANDS', 1)[1].split('];', 1)[0]
+    entries = {c['id']: c for c in manifest()['commands']}
+    checked = 0
+    for cid, path in re.findall(r'\("([a-z0-9-]+)", ([a-z_:]+)\)', table):
+        if cid == 'panel-state':  # shows the settings, takes no parameters
+            continue
+        name = path if '::' in path else 'lib::' + path
+        todo, seen, read = [name], set(), set()
+        while todo:
+            n = todo.pop()
+            if n in seen or n not in fns:
+                continue
+            seen.add(n)
+            module = n.split('::')[0]
+            for _, body in fns[n]:
+                aliases = re.findall(r'let ([a-z_]+) = &?ctx\.settings;', body)
+                for a in ['settings'] + aliases:
+                    read |= {keys[f] for f in re.findall(r'\b%s\.([a-z_]+)' % a, body) if f in keys}
+                read |= set(re.findall(r'req\.(?:f64|bool|str|i64)\("([A-Za-z]+)"\)', body))
+                for q, callee in re.findall(r'\b(?:([a-z_]+)::)?([a-z_0-9]+)\(', body):
+                    c = '%s::%s' % (q or module, callee)
+                    if any('&Ctx' in sig for sig, _ in fns.get(c, [])):
+                        todo.append(c)
+        check(len(seen) >= 1, 'no body found for %s' % cid)
+        params = entries[cid]['params']
+        missing = sorted(k for k in read if '"%s"' % k not in params)
+        check(not missing, '%s reads %s but its params text lacks them: %s' % (cid, missing, params))
+        checked += bool(read)
+    check(checked >= 15, 'too few commands read a parameter: %d' % checked)

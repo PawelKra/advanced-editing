@@ -104,9 +104,17 @@ impl Tm {
         Tm::new(GRS80_A, WGS84_F, zone as f64 * 6.0 - 183.0, 0.9996, 500_000.0, fn_)
     }
 
-    /// (lon, lat) in degrees -> (easting, northing) in metres.
+    /// (lon, lat) in degrees -> (easting, northing) in metres. A longitude on the other side
+    /// of the antimeridian from the central meridian counts from it the short way round.
     pub fn forward(&self, lon_deg: f64, lat_deg: f64) -> (f64, f64) {
-        let (phi, lam) = (lat_deg.to_radians(), lon_deg.to_radians() - self.lon0);
+        let mut lam = lon_deg.to_radians() - self.lon0;
+        // ±360 is exact for longitudes near ±180°
+        if lam > std::f64::consts::PI {
+            lam = (lon_deg - 360.0).to_radians() - self.lon0;
+        } else if lam < -std::f64::consts::PI {
+            lam = (lon_deg + 360.0).to_radians() - self.lon0;
+        }
+        let phi = lat_deg.to_radians();
         let (sphi, cphi) = sin_cos(phi);
         let (slam, clam) = sin_cos(lam);
         // tan of the conformal latitude φ + δ, by the addition theorem
@@ -141,7 +149,15 @@ impl Tm {
         // conformal -> geodetic latitude, sin/cos 2χ from tan χ
         let h2 = 1.0 + taup * taup;
         let delta = clenshaw_real(&self.cgb, 2.0 * taup / h2, (1.0 - taup * taup) / h2);
-        ((lam + self.lon0).to_degrees(), (taup.atan() + delta).to_degrees())
+        let lon = (lam + self.lon0).to_degrees();
+        let lon = if lon > 180.0 {
+            lon - 360.0
+        } else if lon < -180.0 {
+            lon + 360.0
+        } else {
+            lon
+        };
+        (lon, (taup.atan() + delta).to_degrees())
     }
 }
 
@@ -225,8 +241,14 @@ impl Frame {
     /// The frame for a set of lon/lat positions: EPSG:2180 when every position lies in
     /// Poland, else UTM at the centre of their bounding box. Fails on no positions, non-finite
     /// values, polar latitudes or an extent too wide for a single TM frame.
+    ///
+    /// Longitudes are taken on the shorter way round the globe: positions on both sides of
+    /// the antimeridian (179.9° and -179.9°) span 0.2°, centred on 180°.
     pub fn for_positions(points: impl IntoIterator<Item = [f64; 2]>) -> Result<Frame, String> {
         let mut bb = [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY];
+        // the longitude range with negative longitudes moved by 360°: [0, 360) instead of
+        // [-180, 180) has no break at the antimeridian
+        let (mut e0, mut e1) = (f64::INFINITY, f64::NEG_INFINITY);
         let mut all_pl = true;
         let mut n = 0usize;
         for [lon, lat] in points {
@@ -235,6 +257,8 @@ impl Frame {
             }
             all_pl &= in_poland(lon, lat);
             bb = [bb[0].min(lon), bb[1].min(lat), bb[2].max(lon), bb[3].max(lat)];
+            let east = if lon < 0.0 { lon + 360.0 } else { lon };
+            (e0, e1) = (e0.min(east), e1.max(east));
             n += 1;
         }
         if n == 0 {
@@ -243,16 +267,19 @@ impl Frame {
         if bb[1] < -MAX_ABS_LAT_DEG || bb[3] > MAX_ABS_LAT_DEG {
             return Err(format!("features beyond ±{MAX_ABS_LAT_DEG}° latitude are not supported"));
         }
-        if bb[2] - bb[0] > MAX_LON_SPAN_DEG {
+        // a range within 20° cannot hold both 0° and 180°, so one of the two is unbroken
+        let (lon0, lon1) = if e1 - e0 < bb[2] - bb[0] { (e0, e1) } else { (bb[0], bb[2]) };
+        if lon1 - lon0 > MAX_LON_SPAN_DEG {
             return Err(format!(
                 "the features span {:.1}° of longitude; metric editing needs them within {MAX_LON_SPAN_DEG}°",
-                bb[2] - bb[0]
+                lon1 - lon0
             ));
         }
         if all_pl {
             Ok(Frame::epsg2180())
         } else {
-            Ok(Frame::utm_at(0.5 * (bb[0] + bb[2]), 0.5 * (bb[1] + bb[3])))
+            let lon = 0.5 * (lon0 + lon1);
+            Ok(Frame::utm_at(if lon >= 180.0 { lon - 360.0 } else { lon }, 0.5 * (bb[1] + bb[3])))
         }
     }
 

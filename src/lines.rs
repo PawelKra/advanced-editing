@@ -119,7 +119,7 @@ pub fn split_with_line(ctx: &Ctx) -> Res<Value> {
         ed.changed.push((*layer, f.row));
     }
     for (layer, f, g) in &adds {
-        ed.changed.push((*layer, host_io::add_feature(*layer, g, &f.properties)?));
+        ed.changed.push((*layer, host_io::add_feature(*layer, g, &host_io::inherited_attributes(&f.properties))?));
     }
     let note = shared.note();
     let (sv, sf) = (shared.vertices(), shared.features());
@@ -224,7 +224,7 @@ pub fn offset(ctx: &Ctx) -> Res<Value> {
     for (f, out) in ed_in.features.iter().zip(outs) {
         match out {
             Some(o) if in_place => ed.write(ed_in.layer.id, f.row, &o)?,
-            Some(o) => ed.add(ed_in.layer.id, &o, &f.properties)?,
+            Some(o) => ed.add(ed_in.layer.id, &o, &host_io::inherited_attributes(&f.properties))?,
             None => skipped.push(f.id),
         }
     }

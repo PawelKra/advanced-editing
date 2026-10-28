@@ -21,6 +21,7 @@
 //! cadastral data; UTM elsewhere).
 
 use std::cell::RefCell;
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
 
@@ -174,7 +175,7 @@ fn step(x: f64, n: i64) -> f64 {
 
 /// Multiplicative hashing for the placement cache: SipHash costs more than what it caches.
 #[derive(Default)]
-struct KeyHasher(u64);
+pub(crate) struct KeyHasher(u64);
 
 impl Hasher for KeyHasher {
     fn write(&mut self, bytes: &[u8]) {
@@ -715,6 +716,13 @@ impl Placer {
             });
             let e = &ix.edges[k];
             new.push(NewVertex { dim: e.dim, a: e.ll[0], b: e.ll[1], at, owner: e.owner });
+            // where edited edges cross, the vertex is on each of them: their neighbours get it too
+            ix.edge_grid.near(p2(m), EDGE_TOL_M, |j| {
+                let e = &ix.edges[j];
+                if j != k && seg_dist(p2(m), e.m[0], e.m[1]).0 <= EDGE_TOL_M {
+                    new.push(NewVertex { dim: e.dim, a: e.ll[0], b: e.ll[1], at, owner: e.owner });
+                }
+            });
             return at;
         }
         self.tools.snapped(m).unwrap_or_else(|| self.frame.inv_coord(m))
@@ -834,8 +842,10 @@ pub fn note(vertices: usize, features: usize, skipped: &[String]) -> String {
     s
 }
 
-/// New vertices, deduplicated and sorted by longitude, with their edge and position in
-/// metres, to find the segments of other features they lie on.
+/// New vertices sorted by longitude, with their edge and position in metres, to find the
+/// segments of other features they lie on. Vertices at the same position are kept once per
+/// edge and owner: two edited edges crossing at a new vertex each lead it to their own
+/// neighbours.
 struct Lookup {
     frame: Frame,
     /// Sorted by longitude.
@@ -861,9 +871,18 @@ const ANY: usize = usize::MAX;
 
 impl Lookup {
     fn new(frame: Frame, new: &[NewVertex]) -> Lookup {
+        // position first (sorted by longitude), then the edge with its ends in a fixed order,
+        // so that both directions count as one
+        let key = |v: &NewVertex| {
+            let (a, b) = if (v.a.x, v.a.y) <= (v.b.x, v.b.y) { (v.a, v.b) } else { (v.b, v.a) };
+            ([v.at.x, v.at.y, a.x, a.y, b.x, b.y], (v.dim as u8, v.owner))
+        };
         let mut new: Vec<NewVertex> = new.to_vec();
-        new.sort_by(|x, y| x.at.x.total_cmp(&y.at.x).then(x.at.y.total_cmp(&y.at.y)).then((x.dim as u8).cmp(&(y.dim as u8))));
-        new.dedup_by(|y, x| x.at == y.at && x.dim == y.dim);
+        new.sort_by(|x, y| {
+            let ((fx, ix), (fy, iy)) = (key(x), key(y));
+            fx.iter().zip(&fy).fold(Ordering::Equal, |o, (p, q)| o.then(p.total_cmp(q))).then(ix.cmp(&iy))
+        });
+        new.dedup_by(|y, x| key(x) == key(y));
         let f = |c: Coord<f64>| p2(frame.fwd_coord(c));
         let vs: Vec<Near> =
             new.iter().map(|v| Near { m: [f(v.a), f(v.b), f(v.at)], at: v.at, dim: v.dim, owner: v.owner }).collect();
@@ -876,29 +895,41 @@ impl Lookup {
         let (m, dim) = (LONLAT_MARGIN, g.dim());
         let Some(b) = g.bbox() else { return false };
         let (x0, y0, x1, y1) = (b.min().x - m, b.min().y - m, b.max().x + m, b.max().y + m);
+        // wider than half the globe: across the antimeridian, any longitude may be on it
+        let (x0, x1) = if x1 - x0 > 180.0 { (f64::NEG_INFINITY, f64::INFINITY) } else { (x0, x1) };
+        self.by_lon(x0, x1).any(|v| v.dim == dim && v.owner != owner && v.at.y >= y0 && v.at.y <= y1)
+    }
+
+    /// The vertices from longitude `x0` to `x1`.
+    fn by_lon(&self, x0: f64, x1: f64) -> impl Iterator<Item = &Near> {
         let from = self.vs.partition_point(|v| v.at.x < x0);
-        self.vs[from..]
-            .iter()
-            .take_while(|v| v.at.x <= x1)
-            .any(|v| v.dim == dim && v.owner != owner && v.at.y >= y0 && v.at.y <= y1)
+        self.vs[from..].iter().take_while(move |v| v.at.x <= x1)
     }
 
     /// The vertices of `dim` that lie on segment cd (lon/lat) of another feature, strictly
     /// between its ends, while cd runs along the vertex's edge: as (parameter on cd, lon/lat).
     fn on_segment(&self, dim: Dim, owner: usize, c: Coord<f64>, d: Coord<f64>, out: &mut Vec<(f64, Coord<f64>)>) {
         let m = LONLAT_MARGIN;
-        let (sx0, sx1) = (c.x.min(d.x) - m, c.x.max(d.x) + m);
+        let (sx0, sx1) = (c.x.min(d.x), c.x.max(d.x));
         let (sy0, sy1) = (c.y.min(d.y) - m, c.y.max(d.y) + m);
-        let from = self.vs.partition_point(|v| v.at.x < sx0);
+        // a segment across the antimeridian runs from its larger longitude east to its smaller
+        let near = if sx1 - sx0 > 180.0 {
+            self.by_lon(sx1 - m, f64::INFINITY).chain(self.by_lon(f64::NEG_INFINITY, sx0 + m))
+        } else {
+            self.by_lon(sx0 - m, sx1 + m).chain(self.by_lon(f64::INFINITY, f64::NEG_INFINITY))
+        };
+        let dlon = |x: f64| if x > 180.0 { x - 360.0 } else if x < -180.0 { x + 360.0 } else { x };
         let mut metric: Option<(P2, P2)> = None;
-        for v in self.vs[from..].iter().take_while(|v| v.at.x <= sx1) {
+        // (index in `out`, metric position, distance off cd) of the vertices found here
+        let mut found: Vec<(usize, P2, f64)> = Vec::new();
+        for v in near {
             let at = &v.at;
             if v.dim != dim || v.owner == owner || at.y < sy0 || at.y > sy1 || *at == c || *at == d {
                 continue;
             }
             // a metre off the segment in lon/lat is far off it in the frame too: no need to project
-            let (ux, uy) = ((d.x - c.x) * self.m_per_lon, (d.y - c.y) * M_PER_DEG);
-            let (wx, wy) = ((at.x - c.x) * self.m_per_lon, (at.y - c.y) * M_PER_DEG);
+            let (ux, uy) = (dlon(d.x - c.x) * self.m_per_lon, (d.y - c.y) * M_PER_DEG);
+            let (wx, wy) = (dlon(at.x - c.x) * self.m_per_lon, (at.y - c.y) * M_PER_DEG);
             let l = (ux * ux + uy * uy).sqrt();
             if l == 0.0 || (ux * wy - uy * wx).abs() > l {
                 continue;
@@ -915,7 +946,19 @@ impl Lookup {
             if line_dist(cm, a, b) > TOOL_SNAP_M || line_dist(dm, a, b) > TOOL_SNAP_M {
                 continue;
             }
-            out.push((t, *at));
+            // the same vertex through another edge or owner, or placed on each of two crossing
+            // edges, is inserted once: the one closest to cd
+            match found.iter_mut().find(|f| dist(f.1, p) <= EDGE_TOL_M) {
+                Some(f) if dd < f.2 => {
+                    out[f.0] = (t, *at);
+                    (f.1, f.2) = (p, dd);
+                }
+                Some(_) => {}
+                None => {
+                    found.push((out.len(), p, dd));
+                    out.push((t, *at));
+                }
+            }
         }
     }
 }

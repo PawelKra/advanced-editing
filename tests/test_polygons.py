@@ -319,6 +319,32 @@ def test_split_off_part():
         check(unchanged(s, plain))
 
 
+def test_locators_without_geometry_are_refused():
+    # A selection elsewhere made only of features without a geometry must not fall back to
+    # "no locators", which would act on every hole or part.
+    two = polygon(rect(LON, LAT, 100, 100), list(reversed(rect(LON, LAT, 10, 10, 10, 10))),
+                  list(reversed(rect(LON, LAT, 10, 10, 60, 60))))
+    loc = write_layer('loc', [feature(point(LON, LAT, 65, 65), k=1), feature(None, k=2)])
+    with Session(write_layer('holes', [feature(two, name='h')]), multi_layer(), loc) as s:
+        before = snapshot(s, 'holes', 'multi')
+        for layer_name, commands, what in (('holes', ('delete-ring', 'fill-ring'), 'holes'),
+                                           ('multi', ('delete-part', 'split-off-part'), 'parts')):
+            for c in commands:
+                s.select('loc', [1])
+                s.activate(layer_name)
+                s.select(layer_name, [0], add=True)
+                e = s.error_of(c)
+                check("The selected features in 'loc' have no geometry to pick %s with; select features with a "
+                      "geometry or clear that selection" % what in e, (c, e))
+                check(unchanged(s, before), '%s changed the data' % c)
+        # one usable locator next to the null one picks as usual
+        s.select('loc', [0, 1])
+        s.activate('holes')
+        s.select('holes', [0], add=True)
+        r = s.plugin('delete-ring')
+        check(r['rings'] == 1, r)
+
+
 # ---------- gaps ----------
 
 def test_fill_gap():

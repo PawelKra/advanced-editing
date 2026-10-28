@@ -291,7 +291,7 @@ pub fn add_ring(ctx: &Ctx) -> Res<Value> {
 pub fn delete_ring(ctx: &Ctx) -> Res<Value> {
     let spec = EditSpec { whole_layer: ctx.settings.whole_layer, ..EditSpec::new(DELETE_RING_USAGE, POLY) };
     let ed = selection::active_features(&spec)?;
-    let loc = Locators::read(&ed.layer, &ed.layers)?;
+    let loc = Locators::read(&ed.layer, &ed.layers, "holes")?;
     let mut plan = Plan::default();
     let mut removed = 0;
     for f in &ed.features {
@@ -323,7 +323,8 @@ pub fn delete_ring(ctx: &Ctx) -> Res<Value> {
 
 /// Fills holes of the selected polygons with new features carrying the parent's attributes.
 /// Islands lying in a hole (other parts of the feature, other polygons of the layer) stay out
-/// of the new polygon.
+/// of the new polygon. When the layer is too large to read, only the selected features are
+/// checked for islands and the message says so: the fill may then overlap other polygons.
 pub fn fill_ring(ctx: &Ctx) -> Res<Value> {
     let spec = EditSpec {
         whole_layer: ctx.settings.whole_layer,
@@ -331,7 +332,7 @@ pub fn fill_ring(ctx: &Ctx) -> Res<Value> {
         ..EditSpec::new(FILL_RING_USAGE, POLY)
     };
     let ed = selection::active_features(&spec)?;
-    let loc = Locators::read(&ed.layer, &ed.layers)?;
+    let loc = Locators::read(&ed.layer, &ed.layers, "holes")?;
     let parts: Vec<Vec<Polygon<f64>>> = ed.features.iter().map(|f| Ok(polygons_of(f.geom()?).0)).collect::<Res<_>>()?;
     // (feature, part, hole)
     let mut holes = Vec::new();
@@ -344,7 +345,10 @@ pub fn fill_ring(ctx: &Ctx) -> Res<Value> {
         return Err(format!("{FILL_RING_USAGE}. ({})", loc.nothing("holes", ed.features.len())));
     }
     let boxes: Vec<Rect<f64>> = holes.iter().filter_map(|h| h.2.bounding_rect()).collect();
+    // A layer too large to read leaves only the selected features to search for islands.
     let others = layer_islands(&ed, &boxes)?;
+    let layer_checked = others.is_some();
+    let others = others.unwrap_or_else(|| islands_in(&ed.features, &boxes));
     let frame = ed.frame()?;
     let mut snap = VertexSnap::new(frame, SNAP_TOL_M);
     let mut plan = Plan::default();
@@ -353,7 +357,7 @@ pub fn fill_ring(ctx: &Ctx) -> Res<Value> {
         let ring = ccw(h);
         let Some(hb) = ring.bounding_rect() else { continue };
         let own = parts[i].iter().enumerate().filter(|(j, _)| *j != k).map(|(_, p)| p.exterior());
-        let theirs = others.as_deref().unwrap_or_default().iter().filter(|o| o.0 != ed.features[i].id).map(|o| &o.1);
+        let theirs = others.iter().filter(|o| o.0 != ed.features[i].id).map(|o| &o.1);
         let hole = Polygon::new(ring, vec![]);
         let hm = frame.project_geo(&hole);
         let mut inside = Vec::new();
@@ -377,20 +381,11 @@ pub fn fill_ring(ctx: &Ctx) -> Res<Value> {
             islands += inside.len();
             snap.unproject(&Geom::MultiPolygon(touching_exactly(free)))
         };
-        plan.add.push((ed.layer.id, prepare_output(g)?, copied_attributes(&ed.features[i].properties)));
+        plan.add.push((ed.layer.id, prepare_output(g)?, host_io::inherited_attributes(&ed.features[i].properties)));
     }
     let n = plan.add.len();
-    let unread = if others.is_none() {
-        format!(
-            "; other polygons of '{}' were not checked for islands: the layer is too large to read in the same \
-             command (select fewer features)",
-            ed.layer.name
-        )
-    } else {
-        String::new()
-    };
     if n == 0 {
-        return Err(format!("{FILL_RING_USAGE}. (islands cover each of the {covered} hole(s) entirely{unread})"));
+        return Err(format!("{FILL_RING_USAGE}. (islands cover each of the {covered} hole(s) entirely)"));
     }
     plan.apply()?;
     let mut msg = format!("Filled {n} hole(s) with new polygons");
@@ -400,8 +395,14 @@ pub fn fill_ring(ctx: &Ctx) -> Res<Value> {
     if covered > 0 {
         msg += &format!("; {covered} hole(s) not filled: islands cover them entirely");
     }
-    msg += &unread;
-    ctx.finish(&msg, json!({"created": n, "islands": islands, "covered": covered, "layerChecked": others.is_some()}))
+    if !layer_checked {
+        msg += &format!(
+            "; the layer is too large to check its unselected polygons for islands: the new polygon may overlap \
+             unselected polygons of '{}' lying in the hole. Select those polygons too, or undo",
+            ed.layer.name
+        );
+    }
+    ctx.finish(&msg, json!({"created": n, "islands": islands, "covered": covered, "layerChecked": layer_checked}))
 }
 
 /// `mp` with every vertex that lies on another ring's edge (within [`SNAP_TOL_M`], between
@@ -477,9 +478,9 @@ fn within(a: &Rect<f64>, b: &Rect<f64>) -> bool {
     a.min().x >= b.min().x - m && a.min().y >= b.min().y - m && a.max().x <= b.max().x + m && a.max().y <= b.max().y + m
 }
 
-/// The outer rings of the active layer's polygons whose box meets one of `boxes`, as
-/// (feature id, ring), for islands in the holes being filled; `None` when the layer is
-/// too large to read within what the command has left.
+/// The outer rings of the active layer's polygons that may be islands in `boxes` (see
+/// [`islands_in`]); `None` when the layer is too large to read within what the command has
+/// left.
 fn layer_islands(ed: &selection::Editable, boxes: &[Rect<f64>]) -> Res<Option<Vec<(i64, LineString<f64>)>>> {
     let read;
     let feats = if ed.features.len() >= ed.layer.features {
@@ -496,6 +497,11 @@ fn layer_islands(ed: &selection::Editable, boxes: &[Rect<f64>]) -> Res<Option<Ve
             None => return Ok(None),
         }
     };
+    Ok(Some(islands_in(feats, boxes)))
+}
+
+/// The outer rings of `feats` whose box lies within one of `boxes`, as (feature id, ring).
+fn islands_in(feats: &[Feature], boxes: &[Rect<f64>]) -> Vec<(i64, LineString<f64>)> {
     let mut out = Vec::new();
     for f in feats {
         let Some(g) = &f.geometry else { continue };
@@ -510,7 +516,7 @@ fn layer_islands(ed: &selection::Editable, boxes: &[Rect<f64>]) -> Res<Option<Ve
             }
         }
     }
-    Ok(Some(out))
+    out
 }
 
 /// Adds the tool polygons as new parts of the one target polygon.
@@ -574,7 +580,7 @@ pub fn split_off_part(ctx: &Ctx) -> Res<Value> {
 fn parts_command(ctx: &Ctx, split: bool) -> Res<Value> {
     let usage = if split { SPLIT_PART_USAGE } else { DELETE_PART_USAGE };
     let ed = selection::active_features(&EditSpec { properties: split, ..EditSpec::new(usage, POLY) })?;
-    let loc = Locators::read(&ed.layer, &ed.layers)?;
+    let loc = Locators::read(&ed.layer, &ed.layers, "parts")?;
     let mut plan = Plan::default();
     let (mut moved, mut all_hit) = (0, 0);
     for f in &ed.features {
@@ -602,7 +608,7 @@ fn parts_command(ctx: &Ctx, split: bool) -> Res<Value> {
         moved += gone.len();
         plan.set.push((ed.layer.id, f.row, prepare_output(from_polygons(kept.into_iter().map(|x| x.0).collect()))?));
         if split {
-            let attrs = copied_attributes(&f.properties);
+            let attrs = host_io::inherited_attributes(&f.properties);
             for (p, _) in gone {
                 plan.add.push((ed.layer.id, prepare_output(Geom::Polygon(p))?, attrs.clone()));
             }
@@ -729,15 +735,6 @@ fn as_hole(r: &LineString<f64>, exterior: &LineString<f64>) -> LineString<f64> {
     r
 }
 
-/// The parent's field values for a new feature, without its key.
-fn copied_attributes(props: &Map<String, Value>) -> Map<String, Value> {
-    props
-        .iter()
-        .filter(|(k, _)| !k.eq_ignore_ascii_case("id") && !k.eq_ignore_ascii_case("fid"))
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect()
-}
-
 /// Queues the tool features of the active layer for deletion unless they are kept.
 fn delete_tools<'a>(
     plan: &mut Plan,
@@ -771,12 +768,16 @@ pub fn gaps(polys: &[Polygon<f64>]) -> Vec<Polygon<f64>> {
 struct Locators(Vec<(Rect<f64>, geo::Geometry<f64>)>);
 
 impl Locators {
-    fn read(active: &LayerInfo, layers: &[LayerInfo]) -> Res<Locators> {
+    /// Refuses a selection made only of features without a usable geometry: read as "no
+    /// locators", it would act on every hole or part instead of the ones meant.
+    fn read(active: &LayerInfo, layers: &[LayerInfo], what: &str) -> Res<Locators> {
         let mut v = Vec::new();
+        let mut unusable = Vec::new();
         for l in layers.iter().filter(|l| l.id != active.id && l.is_vector() && l.selected > 0) {
             if l.selected > LAYER_READ_CAP {
                 return Err(format!("{} features are selected in '{}'; select fewer locators", l.selected, l.name));
             }
+            let before = v.len();
             for f in host_io::selected_features(l.id, false)? {
                 if let Some(g) = &f.geometry
                     && let Some(bb) = g.bbox()
@@ -784,6 +785,16 @@ impl Locators {
                     v.push((bb, g.to_geo()));
                 }
             }
+            if v.len() == before {
+                unusable.push(format!("'{}'", l.name));
+            }
+        }
+        if v.is_empty() && !unusable.is_empty() {
+            return Err(format!(
+                "The selected features in {} have no geometry to pick {what} with; select features with a geometry \
+                 or clear that selection",
+                unusable.join(", ")
+            ));
         }
         Ok(Locators(v))
     }

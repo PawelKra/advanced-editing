@@ -87,7 +87,15 @@ def test_settings_from_panel_params_and_null():
         check(r['sum'] is False and r['reverse'] is False, r)
         # every Settings field is reported
         check(set(r) == {'distance', 'tolerance', 'iterations', 'parts', 'percent', 'angle', 'bearing', 'keepTools',
-                         'left', 'wholeLayer', 'move', 'sum', 'reverse', 'paramsNull'}, sorted(r))
+                         'left', 'wholeLayer', 'move', 'sum', 'reverse', 'topological', 'paramsNull'}, sorted(r))
+        # topological: on by default, off from the panel, a script parameter overrides the panel
+        check(r['topological'] is True, r)
+        r = s.plugin('diag-settings', {'panel': {'topological': False}})
+        check(r['topological'] is False, r)
+        r = s.plugin('diag-settings', {'topological': True})
+        check(r['topological'] is True, r)
+        r = s.plugin('diag-settings', {})
+        check(r['topological'] is False, r)
         st = s.plugin('panel-state')
         check(st['panel']['items']['distance']['labels'][7] == '1 m', st)
 

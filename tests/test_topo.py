@@ -389,3 +389,21 @@ def test_topology_skips_a_layer_too_large_to_read():
     check(r['split'] == 1 and r['sharedVertices'] == 0, r)
     check("shared vertices not added in 'pl'" in r['message'], r['message'])
     check(after[1]['geometry'] == before[1]['geometry'], 'the neighbour changed')
+
+
+def test_split_shares_a_crossing_of_two_edited_edges_with_both_neighbours():
+    """A and B overlap; A's right edge (shared with NA) and B's slanted edge (shared with NB)
+    cross where the split line has a vertex. The cut puts that vertex on both edges with the
+    same coordinates: each neighbour must get it, not only the one whose edge was kept."""
+    a = feature(poly(sq(0, 0)), name='A')
+    b = feature(poly(ll(O, [(50, -50), (150, -50), (150, 150), (50, -50)])), name='B')
+    na = feature(poly(sq(100, 0)), name='NA')
+    nb = feature(poly(ll(O, [(50, -50), (150, 150), (50, 150), (50, -50)])), name='NB')
+    r, before, after, restored = split_all([a, b, na, nb], [line((-10, 40), (100, 50), (210, 45))], select=[0, 1])
+    check(r['split'] == 2 and r['sharedVertices'] == 2 and r['sharedFeatures'] == 2, r)
+    pieces = [f['geometry'] for f in after if f['properties']['name'] in ('A', 'B')]
+    neighbours_only_gained(before, after, {0, 1}, r, pieces)
+    on_original_edges(before, after)
+    u = union_report([f['geometry'] for f in before], [f['geometry'] for f in after], m_of())
+    check(not u['new_holes'], 'new holes (area, width): %s' % u['new_holes'][:5])
+    check(restored == before, 'undo did not restore')

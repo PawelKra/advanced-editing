@@ -392,6 +392,21 @@ fn edit_call(op: &str, layer: i64, row: Option<usize>, g: &Geom, attributes: Opt
     reply(op, call_text(op, &req)?)
 }
 
+/// Fields that identify a feature: a feature made from another never inherits them, and
+/// merging never sums them. `host.layers` does not say which field is a provider key, so
+/// the usual key names decide (any case).
+pub const ID_FIELDS: [&str; 3] = ["id", "fid", "ogc_fid"];
+
+pub fn is_id_field(name: &str) -> bool {
+    ID_FIELDS.iter().any(|f| name.eq_ignore_ascii_case(f))
+}
+
+/// The field values a feature made from one with `props` inherits: all but [`ID_FIELDS`],
+/// which would repeat a unique key.
+pub fn inherited_attributes(props: &Map<String, Value>) -> Map<String, Value> {
+    props.iter().filter(|(k, _)| !is_id_field(k)).map(|(k, v)| (k.clone(), v.clone())).collect()
+}
+
 /// Appends a feature and returns its row. The host replaces the selection with the new
 /// feature. `attributes` may hold any subset of the layer's fields.
 pub fn add_feature(layer: i64, g: &Geom, attributes: &Map<String, Value>) -> Res<usize> {

@@ -5,6 +5,9 @@
 //! with a neighbour can move on one side only. Vertices a command keeps come back bit-exact
 //! (see [`VertexSnap`]), so features it leaves alone stay untouched.
 
+use std::collections::HashMap;
+use std::hash::BuildHasherDefault;
+
 use geo::{
     Area, ChaikinSmoothing, Coord, Densify, Euclidean, Length, LineString, MultiLineString, MultiPoint,
     MultiPolygon, Polygon, Simplify, unary_union,
@@ -16,6 +19,7 @@ use crate::geojson::{self, COORD_EPS_DEG, Dim, Geom, same_coord};
 use crate::host_io::{self, Res, budget};
 use crate::proj::{SNAP_TOL_M, VertexSnap};
 use crate::selection::{EditSpec, active_features};
+use crate::topo::KeyHasher;
 
 const ALL_DIMS: &[Dim] = &[Dim::Point, Dim::Line, Dim::Polygon];
 const SHAPE_DIMS: &[Dim] = &[Dim::Line, Dim::Polygon];
@@ -41,36 +45,137 @@ fn metric_size(g: &Geom) -> f64 {
 /// Metres within which overlapping lines count as the same line and ends as meeting.
 const DISSOLVE_TOL_M: f64 = 1e-4;
 
-/// The segments of `lines` as (line, index of the first vertex, sorted x range) by min x, for
-/// sweeping pairs whose x ranges come within `DISSOLVE_TOL_M` of each other.
-fn segments_by_x(lines: &[Vec<Coord<f64>>]) -> Vec<(usize, usize, f64, f64)> {
-    let mut segs: Vec<(usize, usize, f64, f64)> = lines
-        .iter()
-        .enumerate()
-        .flat_map(|(l, v)| (1..v.len()).map(move |i| (l, i - 1, v[i - 1].x.min(v[i].x), v[i - 1].x.max(v[i].x))))
-        .collect();
-    segs.sort_by(|a, b| a.2.total_cmp(&b.2));
-    segs
+/// The segments of `lines` for sweeping the pairs whose ranges along the sweep axis come
+/// within `DISSOLVE_TOL_M` of each other: (line, index of the first vertex), end points, and
+/// sorted ranges along the axis (by its minimum) and across it, in separate arrays so that
+/// the sweep reads only what it compares.
+struct Segs {
+    /// How many pairs [`Segs::near_pairs`] looks at.
+    visits: u64,
+    ids: Vec<(usize, usize)>,
+    ends: Vec<[Coord<f64>; 2]>,
+    x0: Vec<f64>,
+    x1: Vec<f64>,
+    y0: Vec<f64>,
+    y1: Vec<f64>,
 }
 
-/// Calls `f(a, b)` for every pair of segments whose bounding boxes come within the tolerance.
-fn near_pairs(lines: &[Vec<Coord<f64>>], mut f: impl FnMut((usize, usize), (usize, usize))) {
-    let segs = segments_by_x(lines);
-    let ys = |l: usize, i: usize| {
-        let (a, b) = (lines[l][i].y, lines[l][i + 1].y);
-        (a.min(b), a.max(b))
-    };
-    for (k, &(la, ia, _, ax1)) in segs.iter().enumerate() {
-        let (ay0, ay1) = ys(la, ia);
-        for &(lb, ib, bx0, _) in &segs[k + 1..] {
-            if bx0 > ax1 + DISSOLVE_TOL_M {
-                break;
-            }
-            let (by0, by1) = ys(lb, ib);
-            if by0 <= ay1 + DISSOLVE_TOL_M && ay0 <= by1 + DISSOLVE_TOL_M {
-                f((la, ia), (lb, ib));
+impl Segs {
+    /// Sweeps along x or y, whichever looks at fewer pairs: along x, the segments of a line
+    /// running north would all be looked at against each other.
+    fn new(lines: &[Vec<Coord<f64>>]) -> Segs {
+        let (x, y) = (Segs::along(lines, false), Segs::along(lines, true));
+        if y.visits < x.visits { y } else { x }
+    }
+
+    fn along(lines: &[Vec<Coord<f64>>], swap: bool) -> Segs {
+        let f = |c: Coord<f64>| if swap { Coord { x: c.y, y: c.x } } else { c };
+        let mut v: Vec<(f64, usize, usize)> = lines
+            .iter()
+            .enumerate()
+            .flat_map(|(l, v)| (1..v.len()).map(move |i| (f(v[i - 1]).x.min(f(v[i]).x), l, i - 1)))
+            .collect();
+        v.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let n = v.len();
+        let mut s = Segs {
+            visits: 0,
+            ids: Vec::with_capacity(n),
+            ends: Vec::with_capacity(n),
+            x0: Vec::with_capacity(n),
+            x1: Vec::with_capacity(n),
+            y0: Vec::with_capacity(n),
+            y1: Vec::with_capacity(n),
+        };
+        for (x0, l, i) in v {
+            let (a, b) = (lines[l][i], lines[l][i + 1]);
+            s.ids.push((l, i));
+            s.ends.push([a, b]);
+            let (a, b) = (f(a), f(b));
+            s.x0.push(x0);
+            s.x1.push(a.x.max(b.x));
+            s.y0.push(a.y.min(b.y));
+            s.y1.push(a.y.max(b.y));
+        }
+        s.visits = s.visit_count();
+        s
+    }
+
+    fn len(&self) -> usize {
+        self.ids.len()
+    }
+
+    /// How many pairs [`Segs::near_pairs`] looks at (those whose ranges along the axis come
+    /// within the tolerance), counted without looking at them.
+    fn visit_count(&self) -> u64 {
+        (0..self.len()).map(|k| (self.x0.partition_point(|&x| x <= self.x1[k] + DISSOLVE_TOL_M) - k - 1) as u64).sum()
+    }
+
+    /// The pairs of segments (by index here, `k < j`) whose bounding boxes come within the
+    /// tolerance, `None` when there are more than `max`. Collected first and then looked at:
+    /// with the caller's work inlined, the loop cost several times more per pair.
+    fn near_pairs(&self, max: usize) -> Option<Vec<(u32, u32)>> {
+        let tol = DISSOLVE_TOL_M;
+        let mut out = Vec::new();
+        for k in 0..self.len() {
+            let (ax1, ay0, ay1) = (self.x1[k] + tol, self.y0[k] - tol, self.y1[k] + tol);
+            let n = self.x0[k + 1..].iter().take_while(|&&x| x <= ax1).count();
+            let (y0, y1) = (&self.y0[k + 1..k + 1 + n], &self.y1[k + 1..k + 1 + n]);
+            for (j, (&b0, &b1)) in y0.iter().zip(y1).enumerate() {
+                if b0 <= ay1 && ay0 <= b1 {
+                    if out.len() == max {
+                        return None;
+                    }
+                    out.push((k as u32, (k + 1 + j) as u32));
+                }
             }
         }
+        Some(out)
+    }
+}
+
+/// Fuel of a line merge per pair of segments [`Segs::near_pairs`] looks at, per pair it finds
+/// close together and per segment, in each of its two sweeps, and per line: upper bounds (by
+/// a third at least) fitted to `diag-bench` runs on up to 2000 lines radiating from one point,
+/// crossing in a grid, lying side by side, running north, chained end to end and overlapping
+/// along one line.
+const MERGE_FUEL_PER_VISIT: u64 = 150;
+const MERGE_FUEL_PER_PAIR: u64 = 650;
+const MERGE_FUEL_PER_SEGMENT: u64 = 8_000;
+const MERGE_FUEL_PER_LINE: u64 = 16_000;
+
+/// What a line merge may still spend; refuses, before anything is written, work that would
+/// not fit in one command.
+pub(crate) struct MergeFuel {
+    pub left: u64,
+    lines: usize,
+}
+
+impl MergeFuel {
+    pub fn new(left: u64) -> MergeFuel {
+        MergeFuel { left, lines: 0 }
+    }
+
+    /// The pairs of `segs` close together, when finding and looking at them fits.
+    fn pairs(&mut self, segs: &Segs) -> Res<Vec<(u32, u32)>> {
+        let sweep = segs.visits.saturating_mul(MERGE_FUEL_PER_VISIT) + segs.len() as u64 * MERGE_FUEL_PER_SEGMENT;
+        if sweep > self.left {
+            return Err(self.too_much(&format!("{} pairs of segments", budget::count(segs.visits as usize))));
+        }
+        self.left -= sweep;
+        let max = (self.left / MERGE_FUEL_PER_PAIR) as usize;
+        let pairs = segs.near_pairs(max).ok_or_else(|| {
+            self.too_much(&format!("more than {} pairs of segments that cross or lie close together", budget::count(max)))
+        })?;
+        self.left -= pairs.len() as u64 * MERGE_FUEL_PER_PAIR;
+        Ok(pairs)
+    }
+
+    fn too_much(&self, pairs: &str) -> String {
+        let pairs = if pairs.is_empty() { String::new() } else { format!(" means comparing {pairs}, and") };
+        format!(
+            "Merging these {} lines{pairs} is more than one command can do. Select fewer lines and merge them in steps.",
+            budget::count(self.lines)
+        )
     }
 }
 
@@ -86,23 +191,37 @@ fn along(a: Coord<f64>, b: Coord<f64>, p: Coord<f64>) -> (f64, f64) {
 /// each segment is split at the ends of the segments it overlaps (with their original
 /// vertices), and the repeated pieces are dropped. Lines that only touch or cross are left
 /// as they are.
-fn dissolve_overlaps(mut lines: Vec<Vec<Coord<f64>>>) -> Vec<Vec<Coord<f64>>> {
+fn dissolve_overlaps(mut lines: Vec<Vec<Coord<f64>>>, fuel: &mut MergeFuel) -> Res<Vec<Vec<Coord<f64>>>> {
     let tol = DISSOLVE_TOL_M;
     // splits[l][i]: (distance along segment i of line l, vertex) to insert
     let mut splits: Vec<Vec<Vec<(f64, Coord<f64>)>>> =
         lines.iter().map(|v| vec![Vec::new(); v.len().saturating_sub(1)]).collect();
-    near_pairs(&lines, |(la, ia), (lb, ib)| {
-        let (a, b) = (lines[la][ia], lines[la][ia + 1]);
-        let (c, d) = (lines[lb][ib], lines[lb][ib + 1]);
+    let segs = Segs::new(&lines);
+    // whether any two segments might repeat each other; without, there is nothing to drop
+    let mut repeats = false;
+    for (k, j) in fuel.pairs(&segs)? {
+        let (k, j) = (k as usize, j as usize);
+        let (((la, ia), [a, b]), ((lb, ib), [c, d])) = ((segs.ids[k], segs.ends[k]), (segs.ids[j], segs.ends[j]));
+        // collinear when the shorter one lies on the longer one's line; most pairs that only
+        // cross or touch are told apart by squares, without the costlier lengths (√2 for
+        // ends that are the same within the tolerance on each axis)
+        let sq = |x: f64| x * x;
+        let (la2, lb2) = (sq(b.x - a.x) + sq(b.y - a.y), sq(d.x - c.x) + sq(d.y - c.y));
+        let ((p, q), (r, t), long2) = if la2 >= lb2 { ((a, b), (c, d), la2) } else { ((c, d), (a, b), lb2) };
+        let off2 = |e: Coord<f64>| sq((q.x - p.x) * (e.y - p.y) - (q.y - p.y) * (e.x - p.x));
+        let max2 = 2.0 * tol * tol * long2 * (1.0 + 1e-9);
+        if off2(r) > max2 || off2(t) > max2 {
+            continue;
+        }
+        repeats = true;
         let (la_len, lb_len) = ((b.x - a.x).hypot(b.y - a.y), (d.x - c.x).hypot(d.y - c.y));
         if la_len <= tol || lb_len <= tol {
-            return;
+            continue;
         }
-        // collinear when the shorter one lies on the longer one's line
-        let ((p, q), (r, t), long_len) = if la_len >= lb_len { ((a, b), (c, d), la_len) } else { ((c, d), (a, b), lb_len) };
+        let long_len = if la2 >= lb2 { la_len } else { lb_len };
         let ((s0, o0), (s1, o1)) = (along(p, q, r), along(p, q, t));
         if o0 > tol || o1 > tol || s0.max(s1).min(long_len) - s0.min(s1).max(0.0) <= tol {
-            return;
+            continue;
         }
         for (l, i, len, ends, (x, y)) in [(la, ia, la_len, (c, d), (a, b)), (lb, ib, lb_len, (a, b), (c, d))] {
             for e in [ends.0, ends.1] {
@@ -112,7 +231,7 @@ fn dissolve_overlaps(mut lines: Vec<Vec<Coord<f64>>>) -> Vec<Vec<Coord<f64>>> {
                 }
             }
         }
-    });
+    }
     for (v, sp) in lines.iter_mut().zip(&mut splits) {
         if sp.iter().all(Vec::is_empty) {
             continue;
@@ -127,17 +246,22 @@ fn dissolve_overlaps(mut lines: Vec<Vec<Coord<f64>>>) -> Vec<Vec<Coord<f64>>> {
         out.push(v[v.len() - 1]);
         *v = out;
     }
+    if !repeats {
+        return Ok(lines);
+    }
     // drop a segment repeated by an earlier one (lowest line, then vertex)
     let mut dropped: Vec<Vec<bool>> = lines.iter().map(|v| vec![false; v.len().saturating_sub(1)]).collect();
     let same = |a: Coord<f64>, b: Coord<f64>| same_coord(a, b, tol);
-    near_pairs(&lines, |x, y| {
-        let (first, second) = if x <= y { (x, y) } else { (y, x) };
-        let (a, b) = (lines[first.0][first.1], lines[first.0][first.1 + 1]);
-        let (c, d) = (lines[second.0][second.1], lines[second.0][second.1 + 1]);
+    let segs = Segs::new(&lines);
+    for (k, j) in fuel.pairs(&segs)? {
+        let (k, j) = (k as usize, j as usize);
+        let (first, second) = if segs.ids[k] <= segs.ids[j] { (k, j) } else { (j, k) };
+        let ([a, b], [c, d]) = (segs.ends[first], segs.ends[second]);
         if (same(a, c) && same(b, d)) || (same(a, d) && same(b, c)) {
-            dropped[second.0][second.1] = true;
+            let (l, i) = segs.ids[second];
+            dropped[l][i] = true;
         }
-    });
+    }
     let mut out = Vec::new();
     for (v, drop) in lines.into_iter().zip(&dropped) {
         if !drop.contains(&true) {
@@ -162,52 +286,120 @@ fn dissolve_overlaps(mut lines: Vec<Vec<Coord<f64>>>) -> Vec<Vec<Coord<f64>>> {
             out.push(run);
         }
     }
-    out
+    Ok(out)
 }
 
-/// Joins lines end to end where exactly two ends meet within `eps` (as GEOS's line merge
-/// does), keeping the original coordinates.
+/// Dissolves metric lines where they run over each other and joins them where their ends
+/// meet (see [`dissolve_overlaps`] and [`merge_lines`]), within `fuel`.
+pub(crate) fn merge_metric_lines(parts: Vec<Vec<Coord<f64>>>, fuel: &mut MergeFuel) -> Res<Vec<Vec<Coord<f64>>>> {
+    fuel.lines = parts.len();
+    fuel.left = fuel.left.checked_sub(parts.len() as u64 * MERGE_FUEL_PER_LINE).ok_or_else(|| fuel.too_much(""))?;
+    Ok(merge_lines(dissolve_overlaps(parts, fuel)?, DISSOLVE_TOL_M))
+}
+
+/// Joins lines end to end through the points where exactly two ends meet within `eps` (as
+/// GEOS's line merge does), keeping the original coordinates: ends are gathered into nodes
+/// once, then each chain is followed from its lowest line in both directions.
 fn merge_lines(mut parts: Vec<Vec<Coord<f64>>>, eps: f64) -> Vec<Vec<Coord<f64>>> {
-    let ends = |p: &Vec<Coord<f64>>| (p[0], p[p.len() - 1]);
-    let degree = |parts: &[Vec<Coord<f64>>], c: Coord<f64>| {
-        parts
-            .iter()
-            .map(|p| {
-                let (a, b) = ends(p);
-                same_coord(a, c, eps) as usize + same_coord(b, c, eps) as usize
-            })
-            .sum::<usize>()
+    // end k is the first vertex of line k / 2 for even k, the last for odd k
+    let end = |parts: &[Vec<Coord<f64>>], k: usize| {
+        let p = &parts[k / 2];
+        if k % 2 == 0 { p[0] } else { p[p.len() - 1] }
     };
-    'outer: loop {
-        for i in 0..parts.len() {
-            for j in 0..parts.len() {
-                if i == j {
-                    continue;
-                }
-                let ((si, ei), (sj, ej)) = (ends(&parts[i]), ends(&parts[j]));
-                let joined = if same_coord(ei, sj, eps) && degree(&parts, ei) == 2 {
-                    Some(parts[i].iter().chain(&parts[j][1..]).copied().collect::<Vec<_>>())
-                } else if same_coord(ei, ej, eps) && degree(&parts, ei) == 2 {
-                    Some(parts[i].iter().chain(parts[j].iter().rev().skip(1)).copied().collect())
-                } else if same_coord(si, sj, eps) && degree(&parts, si) == 2 {
-                    Some(parts[j].iter().rev().chain(&parts[i][1..]).copied().collect())
-                } else {
-                    None
-                };
-                if let Some(v) = joined {
-                    let (hi, lo) = (i.max(j), i.min(j));
-                    parts.remove(hi);
-                    parts[lo] = v;
-                    continue 'outer;
+    // nodes in a grid of cells 8 eps wide: a node within eps lies in the end's own cell or,
+    // near its border, in a neighbouring one
+    let cell = 8.0 * eps;
+    let mut heads: HashMap<(i64, i64), usize, BuildHasherDefault<KeyHasher>> = HashMap::default();
+    // per node: its first end's position, the previous node in its cell, how many ends meet
+    // there and the first two of them
+    let mut nodes: Vec<(Coord<f64>, usize, usize, [usize; 2])> = Vec::new();
+    let mut node_of = vec![0; 2 * parts.len()];
+    for k in 0..2 * parts.len() {
+        let c = end(&parts, k);
+        let (fx, fy) = (c.x / cell, c.y / cell);
+        let (cx, cy) = (fx.floor(), fy.floor());
+        let near = |f: f64, i: f64| -> &[i64] {
+            let r = (f - i) * cell;
+            if r <= eps {
+                &[0, -1]
+            } else if r >= cell - eps {
+                &[0, 1]
+            } else {
+                &[0]
+            }
+        };
+        let mut found = usize::MAX;
+        for &dx in near(fx, cx) {
+            for &dy in near(fy, cy) {
+                let mut n = heads.get(&(cx as i64 + dx, cy as i64 + dy)).copied().unwrap_or(usize::MAX);
+                while n != usize::MAX {
+                    if n < found && same_coord(nodes[n].0, c, eps) {
+                        found = n;
+                    }
+                    n = nodes[n].1;
                 }
             }
         }
-        return parts;
+        if found == usize::MAX {
+            found = nodes.len();
+            let prev = heads.insert((cx as i64, cy as i64), found).unwrap_or(usize::MAX);
+            nodes.push((c, prev, 0, [0; 2]));
+        }
+        let node = &mut nodes[found];
+        if node.2 < 2 {
+            node.3[node.2] = k;
+        }
+        node.2 += 1;
+        node_of[k] = found;
     }
+    // the other end at the node of end `k` when exactly two meet there
+    let next = |k: usize| {
+        let (_, _, count, [a, b]) = nodes[node_of[k]];
+        (count == 2).then_some(if a == k { b } else { a })
+    };
+    let mut used = vec![false; parts.len()];
+    let mut out = Vec::new();
+    for first in 0..parts.len() {
+        if used[first] {
+            continue;
+        }
+        used[first] = true;
+        let mut line = std::mem::take(&mut parts[first]);
+        // forwards from its last vertex: each next line is appended without its joining vertex
+        let mut k = 2 * first + 1;
+        while let Some(o) = next(k).filter(|o| !used[o / 2]) {
+            used[o / 2] = true;
+            let p = std::mem::take(&mut parts[o / 2]);
+            if o % 2 == 0 {
+                line.extend_from_slice(&p[1..]);
+            } else {
+                line.extend(p.iter().rev().skip(1));
+            }
+            k = o ^ 1;
+        }
+        // backwards from its first vertex: each previous line keeps its joining vertex;
+        // `before` runs from the joint outwards
+        let (mut before, mut skip) = (Vec::new(), 0);
+        let mut k = 2 * first;
+        while let Some(o) = next(k).filter(|o| !used[o / 2]) {
+            used[o / 2] = true;
+            let p = std::mem::take(&mut parts[o / 2]);
+            if before.pop().is_none() {
+                skip = 1;
+            }
+            if o % 2 == 0 {
+                before.extend_from_slice(&p);
+            } else {
+                before.extend(p.iter().rev());
+            }
+            k = o ^ 1;
+        }
+        before.reverse();
+        before.extend_from_slice(&line[skip..]);
+        out.push(before);
+    }
+    out
 }
-
-/// Fields that identify a feature: never summed.
-const ID_FIELDS: [&str; 3] = ["id", "fid", "ogc_fid"];
 
 fn is_numeric_kind(kind: &str) -> bool {
     let k = kind.to_ascii_lowercase();
@@ -288,7 +480,10 @@ pub fn merge_with_attributes(ctx: &Ctx) -> Res<Value> {
                 .filter(|l| !l.0.is_empty())
                 .map(|l| l.0)
                 .collect();
-            let lines = merge_lines(dissolve_overlaps(parts), DISSOLVE_TOL_M);
+            // everything is computed before the first write, so a refusal changes nothing
+            let read = budget::edit_fuel(ed.features.len(), budget::vertices(&ed.features));
+            let mut fuel = MergeFuel::new((budget::COMMAND_FUEL * 9 / 10).saturating_sub(read));
+            let lines = merge_metric_lines(parts, &mut fuel)?;
             snap.unproject(&Geom::MultiLineString(MultiLineString(lines.into_iter().map(LineString).collect())))
         }
         Dim::Point => Geom::MultiPoint(MultiPoint(
@@ -303,7 +498,7 @@ pub fn merge_with_attributes(ctx: &Ctx) -> Res<Value> {
     let mut summed = 0;
     if sum {
         let numeric = ed.layer.fields.iter().filter(|f| {
-            is_numeric_kind(&f.kind) && !ID_FIELDS.contains(&f.name.to_ascii_lowercase().as_str())
+            is_numeric_kind(&f.kind) && !host_io::is_id_field(&f.name)
         });
         for field in numeric {
             let total = sum_values(
@@ -401,7 +596,7 @@ pub fn copy_move(ctx: &Ctx) -> Res<Value> {
             rows.push(f.row);
         } else {
             let attrs: Map<String, Value> =
-                f.properties.iter().filter(|(k, _)| layer.has_field(k)).map(|(k, v)| (k.clone(), v.clone())).collect();
+                host_io::inherited_attributes(&f.properties).into_iter().filter(|(k, _)| layer.has_field(k)).collect();
             rows.push(host_io::add_feature(layer.id, &g, &attrs)?);
         }
     }

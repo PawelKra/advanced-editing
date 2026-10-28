@@ -17,14 +17,18 @@
 //!
 //! Areas are ellipsoidal by default: the plane of the working frame (EPSG:2180 or UTM) is
 //! conformal, so the ellipsoid area of an element is its frame area divided by k², the point
-//! scale factor squared. 1/k² is linearised around the parcel, which makes the integral exact
-//! for a linear density: the frame area divided by k² at each part's own centroid. Planar
-//! mode measures in the frame.
+//! scale factor squared. For placing the cuts, 1/k² is interpolated over the parcel by a
+//! polynomial of degree 4 across and 2 along the meridian (k grows with the squared distance
+//! from the central meridian, so a linear model leaves errors of 1e-4 on 200 km); Green's
+//! theorem then integrates it exactly with a 4-point Gauss rule per edge. The finished parts
+//! are measured independently: on the cylindrical equal-area projection of the ellipsoid
+//! (authalic latitude), each edge as the curve a straight frame line makes there. The parts'
+//! areas and errors are reported from that measure. Planar mode measures in the frame.
 
 use geo::{Coord, MultiPolygon, Polygon};
 use i_overlay::core::fill_rule::FillRule;
 use i_overlay::float::slice::FloatSlice;
-use rustgis_plugin::{Map, Request, ToolOutput, Value, json};
+use rustgis_plugin::{Request, ToolOutput, Value, json};
 
 use crate::geojson::{self, Dim, Geom, P2};
 use crate::host_io::{self, Res, budget};
@@ -50,12 +54,13 @@ fn whole_parts(name: &str, x: f64, max: usize) -> Res<usize> {
 }
 
 /// Fuel to divide one polygon of `v` vertices into `p` parts, without reading or writing it:
-/// an upper bound fitted to `diag-bench` runs on wavy and comb-shaped rings of 20 to 12 000
+/// an upper bound fitted to `diag-bench` runs on wavy and comb-shaped rings of 20 to 9000
 /// vertices cut into 2 to 50 parts. Cuts through a ring that zigzags across them cost the
-/// most, hence the large `v * p` term.
+/// most, hence the large `v * p` term. Measuring the parts on the ellipsoid (an inverse
+/// projection per edge) takes about 4500 per vertex of it.
 fn divide_fuel(v: usize, p: usize) -> u64 {
     let (v, p) = (v as u64, p as u64);
-    22_000 * v + 3_000 * v * p + 200_000 * p
+    29_000 * v + 4_500 * v * p + 325_000 * p
 }
 
 /// Refuses dividing `parcels` (vertices, parts) when reading them, dividing them and writing
@@ -67,9 +72,6 @@ fn check_division(parcels: &[(usize, usize)], fuel: u64, too_much: impl Fn(usize
     let need = budget::edit_fuel(parcels.len(), vertices) + compute + budget::edit_fuel(parts, vertices + 4 * parts);
     if need <= fuel { Ok(()) } else { Err(too_much(parcels.len(), vertices, parts)) }
 }
-
-/// Fields that identify a feature and are not copied to the new parts.
-const ID_FIELDS: [&str; 3] = ["id", "fid", "ogc_fid"];
 
 /// How areas are measured.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -140,34 +142,232 @@ impl Moments {
     }
 }
 
-/// Area density of the frame plane, linear in local coordinates: ∫ g dA is the area.
+/// The largest parcel (bounding box side in the frame, m) divided by ellipsoidal area. Up to
+/// this size the density model below stays within 3e-8 of 1/k² anywhere in a UTM zone or in
+/// Poland, and parts of squares this large 2° from the central meridian come out within
+/// 1.4e-8 of their share by GeographicLib's geodesic area, far inside the 1e-6 promised.
+/// Larger parcels are refused rather than cut beyond the range that was checked.
+pub const MAX_ELLIPSOIDAL_EXTENT_M: f64 = 1_000_000.0;
+
+/// Polynomial degrees of the density model across (x) and along (y) the meridian.
+const DEG_X: usize = 4;
+const DEG_Y: usize = 2;
+
+/// Gauss-Legendre nodes and weights on [0, 1], exact up to degree 7: the antiderivative of
+/// the density along an edge has degree DEG_X + 1 + DEG_Y.
+const GAUSS4: [(f64, f64); 4] = [
+    (0.5 - 0.5 * 0.861_136_311_594_052_6, 0.5 * 0.347_854_845_137_453_86),
+    (0.5 - 0.5 * 0.339_981_043_584_856_3, 0.5 * 0.652_145_154_862_546_1),
+    (0.5 + 0.5 * 0.339_981_043_584_856_3, 0.5 * 0.652_145_154_862_546_1),
+    (0.5 + 0.5 * 0.861_136_311_594_052_6, 0.5 * 0.347_854_845_137_453_86),
+];
+
+/// Monomial coefficients of the Chebyshev polynomials T0..T4.
+const CHEB: [[f64; 5]; 5] = [
+    [1.0, 0.0, 0.0, 0.0, 0.0],
+    [0.0, 1.0, 0.0, 0.0, 0.0],
+    [-1.0, 0.0, 2.0, 0.0, 0.0],
+    [0.0, -3.0, 0.0, 4.0, 0.0],
+    [1.0, 0.0, -8.0, 0.0, 8.0],
+];
+
+/// Area density g of the frame plane around a parcel, so that ∫ g dA over a region of the
+/// frame is its area: a polynomial in u = x / h, v = y / h (local metres).
 #[derive(Clone, Copy, Debug)]
 struct Density {
-    g0: f64,
-    gx: f64,
-    gy: f64,
+    h: f64,
+    /// g = Σ g[j][i] uⁱ vʲ
+    g: [[f64; DEG_X + 1]; DEG_Y + 1],
+    /// ∫₀ᵘ g du = Σ ga[j][i] uⁱ⁺¹ vʲ
+    ga: [[f64; DEG_X + 1]; DEG_Y + 1],
 }
 
 impl Density {
-    const PLANAR: Density = Density { g0: 1.0, gx: 0.0, gy: 0.0 };
+    const PLANAR: Density = Density {
+        h: 1.0,
+        g: [[1.0, 0.0, 0.0, 0.0, 0.0], [0.0; 5], [0.0; 5]],
+        ga: [[1.0, 0.0, 0.0, 0.0, 0.0], [0.0; 5], [0.0; 5]],
+    };
 
-    /// 1/k² around `origin` (frame metres), from central differences over `step` metres.
-    fn ellipsoidal(frame: &Frame, origin: Coord<f64>, step: f64) -> Density {
-        let g = |dx: f64, dy: f64| 1.0 / scale_factor(frame, origin.x + dx, origin.y + dy).powi(2);
-        Density {
-            g0: g(0.0, 0.0),
-            gx: (g(step, 0.0) - g(-step, 0.0)) / (2.0 * step),
-            gy: (g(0.0, step) - g(0.0, -step)) / (2.0 * step),
+    /// 1/k² interpolated at Chebyshev nodes of the square of half side `h` around `origin`
+    /// (frame metres).
+    fn ellipsoidal(frame: &Frame, origin: Coord<f64>, h: f64) -> Density {
+        const NX: usize = DEG_X + 1;
+        const NY: usize = DEG_Y + 1;
+        // tx[k][i] = T_k(u_i) = cos(k θ_i) at the nodes u_i = cos θ_i
+        let table = |n: usize| {
+            let mut t = [[0.0; NX]; NX];
+            for (k, row) in t.iter_mut().enumerate().take(n) {
+                for (i, x) in row.iter_mut().enumerate().take(n) {
+                    *x = (k as f64 * std::f64::consts::PI * (i as f64 + 0.5) / n as f64).cos();
+                }
+            }
+            t
+        };
+        let (tx, ty) = (table(NX), table(NY));
+        let mut f = [[0.0; NX]; NY];
+        for (j, row) in f.iter_mut().enumerate() {
+            for (i, x) in row.iter_mut().enumerate() {
+                *x = scale_factor(frame, origin.x + h * tx[1][i], origin.y + h * ty[1][j]).powi(-2);
+            }
         }
+        // Chebyshev coefficients by the discrete cosine transform, then monomials
+        let mut g = [[0.0; NX]; NY];
+        for l in 0..NY {
+            for k in 0..NX {
+                let mut c = 0.0;
+                for (j, row) in f.iter().enumerate() {
+                    for (i, x) in row.iter().enumerate() {
+                        c += x * tx[k][i] * ty[l][j];
+                    }
+                }
+                c *= (2.0 / NX as f64) * (2.0 / NY as f64);
+                if k == 0 {
+                    c *= 0.5;
+                }
+                if l == 0 {
+                    c *= 0.5;
+                }
+                for (b, row) in g.iter_mut().enumerate() {
+                    for (a, x) in row.iter_mut().enumerate() {
+                        *x += c * CHEB[k][a] * CHEB[l][b];
+                    }
+                }
+            }
+        }
+        Density::new(h, g)
     }
 
-    fn measure(&self, m: Moments) -> f64 {
-        self.g0 * m.a + self.gx * m.sx + self.gy * m.sy
+    fn new(h: f64, g: [[f64; DEG_X + 1]; DEG_Y + 1]) -> Density {
+        let mut ga = g;
+        for row in &mut ga {
+            for (i, c) in row.iter_mut().enumerate() {
+                *c /= (i + 1) as f64;
+            }
+        }
+        Density { h, g, ga }
+    }
+
+    /// ∫₀ᵘ g du at (u, v).
+    fn antiderivative(&self, u: f64, v: f64) -> f64 {
+        let mut r = 0.0;
+        for row in self.ga.iter().rev() {
+            r = r * v + row.iter().rev().fold(0.0, |p, c| p * u + c) * u;
+        }
+        r
+    }
+
+    /// The edge p -> q's term of the area by Green's theorem (∮ G dy, ∂G/∂x = g).
+    fn edge(&self, p: Coord<f64>, q: Coord<f64>) -> f64 {
+        let dy = q.y - p.y;
+        if dy == 0.0 {
+            return 0.0;
+        }
+        let (pu, pv) = (p.x / self.h, p.y / self.h);
+        let (du, dv) = ((q.x - p.x) / self.h, dy / self.h);
+        let s: f64 = GAUSS4.iter().map(|&(t, w)| w * self.antiderivative(pu + t * du, pv + t * dv)).sum();
+        self.h * dy * s
     }
 
     /// The density at a local point (for converting ground lengths).
     fn at(&self, x: f64, y: f64) -> f64 {
-        self.g0 + self.gx * x + self.gy * y
+        let (u, v) = (x / self.h, y / self.h);
+        let mut r = 0.0;
+        for row in self.g.iter().rev() {
+            r = r * v + row.iter().rev().fold(0.0, |p, c| p * u + c);
+        }
+        r
+    }
+}
+
+/// Ellipsoidal areas measured on the cylindrical equal-area projection (authalic latitude),
+/// independently of [`Density`]: it reports what the cuts achieved.
+struct Authalic {
+    frame: Frame,
+    e2: f64,
+    e: f64,
+}
+
+/// Edges are measured in pieces of at most this length (m) of the frame. A straight frame
+/// line is a curve on the equal-area projection; the parabola through each piece's midpoint
+/// measures it to 0.002 m² on a 200 km parcel (0.5 m² with 20 km pieces), and to 1e-4 m²
+/// on edges up to a few km.
+const AUTHALIC_PIECE_M: f64 = 5_000.0;
+
+impl Authalic {
+    fn new(frame: Frame) -> Authalic {
+        let f = match frame.kind {
+            FrameKind::Epsg2180 => GRS80_F,
+            FrameKind::Utm { .. } => WGS84_F,
+        };
+        let e2 = f * (2.0 - f);
+        Authalic { frame, e2, e: e2.sqrt() }
+    }
+
+    /// Equal-area (x, y) of lon/lat degrees, x from the meridian `lon0`, y from `y0`.
+    fn xy(&self, c: Coord<f64>, lon0: f64, y0: f64) -> (f64, f64) {
+        let mut dl = c.x - lon0;
+        if dl.abs() > 180.0 {
+            dl -= 360.0f64.copysign(dl);
+        }
+        let s = c.y.to_radians().sin();
+        let q = (1.0 - self.e2) * (s / (1.0 - self.e2 * s * s) + (self.e * s).atanh() / self.e);
+        (GRS80_A * dl.to_radians(), 0.5 * GRS80_A * q - y0)
+    }
+
+    /// The signed area of a ring given twice: in frame metres and in lon/lat (the same
+    /// vertices, as unprojected). Its edges are straight in the frame.
+    fn ring(&self, metric: &[Coord<f64>], lonlat: &[Coord<f64>]) -> f64 {
+        let n = metric.len();
+        if n < 3 || lonlat.len() != n {
+            return 0.0;
+        }
+        let lon0 = lonlat[0].x;
+        let (_, y0) = self.xy(lonlat[0], lon0, 0.0);
+        let at = |m: Coord<f64>| {
+            let (lon, lat) = self.frame.inv(m.x, m.y);
+            self.xy(Coord { x: lon, y: lat }, lon0, y0)
+        };
+        let mut s = 0.0;
+        let mut a = self.xy(lonlat[0], lon0, y0);
+        for i in 0..n {
+            let j = (i + 1) % n;
+            let (p, q) = (metric[i], metric[j]);
+            let end = self.xy(lonlat[j], lon0, y0);
+            let k = ((q.x - p.x).hypot(q.y - p.y) / AUTHALIC_PIECE_M).ceil().max(1.0);
+            let pieces = k as usize;
+            for step in 1..=pieces {
+                let b = if step == pieces {
+                    end
+                } else {
+                    let t = step as f64 / k;
+                    at(Coord { x: p.x + (q.x - p.x) * t, y: p.y + (q.y - p.y) * t })
+                };
+                let t = (step as f64 - 0.5) / k;
+                let m = at(Coord { x: p.x + (q.x - p.x) * t, y: p.y + (q.y - p.y) * t });
+                // the chord, then the parabolic segment between chord and curve (4/3 of the
+                // triangle through the midpoint)
+                s += 0.5 * (a.0 * b.1 - b.0 * a.1);
+                s += (2.0 / 3.0) * ((m.0 - a.0) * (b.1 - a.1) - (b.0 - a.0) * (m.1 - a.1));
+                a = b;
+            }
+        }
+        s
+    }
+
+    /// The area of polygons given in frame metres and in lon/lat (as unprojected), m².
+    fn area(&self, metric: &MultiPolygon<f64>, lonlat: &MultiPolygon<f64>) -> f64 {
+        let mut total = 0.0;
+        for (pm, pl) in metric.0.iter().zip(&lonlat.0) {
+            let rings_m = std::iter::once(pm.exterior()).chain(pm.interiors());
+            let rings_l = std::iter::once(pl.exterior()).chain(pl.interiors());
+            for (k, (rm, rl)) in rings_m.zip(rings_l).enumerate() {
+                let n = rm.0.len() - usize::from(rm.0.len() > 1 && rm.0.first() == rm.0.last());
+                let a = self.ring(&rm.0[..n], &rl.0[..n.min(rl.0.len())]).abs();
+                total += if k == 0 { a } else { -a };
+            }
+        }
+        total
     }
 }
 
@@ -208,25 +408,6 @@ fn weighted_rings(mp: &MultiPolygon<f64>) -> Vec<(Vec<Coord<f64>>, f64)> {
     out
 }
 
-/// Clips a cyclic ring to {n·p <= t} (Sutherland-Hodgman). The result may run along the cut
-/// line back and forth for concave rings, which Green's theorem integrates correctly.
-fn clip_ring(pts: &[Coord<f64>], n: P2, t: f64, out: &mut Vec<Coord<f64>>) {
-    out.clear();
-    let f = |c: &Coord<f64>| n[0] * c.x + n[1] * c.y - t;
-    let len = pts.len();
-    for i in 0..len {
-        let (a, b) = (pts[i], pts[(i + 1) % len]);
-        let (fa, fb) = (f(&a), f(&b));
-        if fa <= 0.0 {
-            out.push(a);
-        }
-        if (fa < 0.0 && fb > 0.0) || (fa > 0.0 && fb < 0.0) {
-            let s = fa / (fa - fb);
-            out.push(Coord { x: a.x + (b.x - a.x) * s, y: a.y + (b.y - a.y) * s });
-        }
-    }
-}
-
 // ---------- one parcel ----------
 
 /// A parcel prepared for division: projected to its frame and moved to local coordinates
@@ -238,8 +419,12 @@ pub struct Parcel {
     origin: Coord<f64>,
     local: MultiPolygon<f64>,
     rings: Vec<(Vec<Coord<f64>>, f64)>,
+    /// Each ring's edges' terms of the area (edge i runs from vertex i to the next).
+    edge_terms: Vec<Vec<f64>>,
     dens: Density,
-    /// The parcel's area (per the area mode).
+    mode: AreaMode,
+    /// The parcel's area per the area mode, from the density model (within 3e-8 of the
+    /// ellipsoidal area up to [`MAX_ELLIPSOIDAL_EXTENT_M`]).
     pub area: f64,
 }
 
@@ -260,9 +445,11 @@ pub enum Plan {
 pub struct Part {
     /// Lon/lat, ready to write.
     pub geom: Geom,
-    /// Its area per the area mode, measured on the cut geometry.
+    /// Its area per the area mode, measured on the cut geometry (ellipsoidal: by
+    /// [`Authalic`], not by the model that placed the cuts).
     pub area: f64,
-    /// The area it was cut for (`None` for a remainder or a strip).
+    /// The area it was cut for: its share of the parts' total, or the requested area (`None`
+    /// for a remainder or a strip).
     pub target: Option<f64>,
     /// The vertices the cuts put on the parcel's edges.
     pub new_vertices: Vec<NewVertex>,
@@ -297,33 +484,76 @@ impl Parcel {
         let local = MultiPolygon(
             metric.0.iter().map(|p| geo::MapCoords::map_coords(p, |c| c - origin)).collect::<Vec<Polygon<f64>>>(),
         );
+        let side = (hi[0] - lo[0]).max(hi[1] - lo[1]);
         let dens = match mode {
             AreaMode::Planar => Density::PLANAR,
-            AreaMode::Ellipsoidal => {
-                let step = (0.5 * (hi[0] - lo[0]).max(hi[1] - lo[1])).max(10.0);
-                Density::ellipsoidal(&frame, origin, step)
+            AreaMode::Ellipsoidal if side > MAX_ELLIPSOIDAL_EXTENT_M => {
+                return Err(format!(
+                    "the parcel is {:.0} km across in {}; ellipsoidal areas are guaranteed to 1 ppm on parcels up to \
+                     {:.0} km. Split it first, or divide it with the Divide Parcel tool and areaMode \"Planar\" \
+                     (areas in the frame's plane)",
+                    side / 1000.0,
+                    frame.name(),
+                    MAX_ELLIPSOIDAL_EXTENT_M / 1000.0
+                ));
             }
+            AreaMode::Ellipsoidal => Density::ellipsoidal(&frame, origin, (0.5 * side).max(1.0)),
         };
         let rings = weighted_rings(&local);
-        let mut m = Moments::default();
-        for (r, w) in &rings {
-            m.add(Moments::of(r).scaled(*w));
-        }
-        let area = dens.measure(m);
+        let edge_terms: Vec<Vec<f64>> = rings
+            .iter()
+            .map(|(r, _)| (0..r.len()).map(|i| dens.edge(r[i], r[(i + 1) % r.len()])).collect())
+            .collect();
+        let area: f64 = rings.iter().zip(&edge_terms).map(|((_, w), e)| w * e.iter().sum::<f64>()).sum();
         if !(area > 0.0) {
             return Err("the polygon has no area".into());
         }
-        Ok(Parcel { placer, metric: metric_geom, origin, local, rings, dens, area })
+        Ok(Parcel { placer, metric: metric_geom, origin, local, rings, edge_terms, dens, mode, area })
     }
 
-    /// The area of the parcel on the start side of the line {n·p = t}.
-    fn area_before(&self, n: P2, t: f64, buf: &mut Vec<Coord<f64>>) -> f64 {
-        let mut m = Moments::default();
-        for (r, w) in &self.rings {
-            clip_ring(r, n, t, buf);
-            m.add(Moments::of(buf).scaled(*w));
+    /// The area of the parcel on the start side of the line {n·p = t}: each ring clipped to
+    /// that half-plane (Sutherland-Hodgman) and integrated with Green's theorem. The clipped
+    /// ring may run along the cut line back and forth for concave rings, which the integral
+    /// handles. Whole edges add their stored terms; only the pieces the line makes are
+    /// integrated here.
+    fn area_before(&self, n: P2, t: f64) -> f64 {
+        let f = |c: Coord<f64>| n[0] * c.x + n[1] * c.y - t;
+        let mut total = 0.0;
+        for ((pts, w), terms) in self.rings.iter().zip(&self.edge_terms) {
+            let len = pts.len();
+            // clipped ring points, with Some(i) for vertex i of the ring
+            let link = |a: (Coord<f64>, Option<usize>), b: (Coord<f64>, Option<usize>)| match (a.1, b.1) {
+                (Some(i), Some(j)) if j == (i + 1) % len => terms[i],
+                _ => self.dens.edge(a.0, b.0),
+            };
+            let (mut first, mut prev) = (None, None);
+            let mut s = 0.0;
+            let mut emit = |p: (Coord<f64>, Option<usize>)| {
+                match prev {
+                    Some(q) => s += link(q, p),
+                    None => first = Some(p),
+                }
+                prev = Some(p);
+            };
+            let mut fa = f(pts[0]);
+            for i in 0..len {
+                let (a, b) = (pts[i], pts[(i + 1) % len]);
+                let fb = f(b);
+                if fa <= 0.0 {
+                    emit((a, Some(i)));
+                }
+                if (fa < 0.0 && fb > 0.0) || (fa > 0.0 && fb < 0.0) {
+                    let r = fa / (fa - fb);
+                    emit((Coord { x: a.x + (b.x - a.x) * r, y: a.y + (b.y - a.y) * r }, None));
+                }
+                fa = fb;
+            }
+            if let (Some(p), Some(q)) = (prev, first) {
+                s += link(p, q);
+            }
+            total += w * s;
         }
-        self.dens.measure(m)
+        total
     }
 
     /// The range of n·p over the parcel.
@@ -341,7 +571,7 @@ impl Parcel {
     /// The cut position in [lo, hi] that leaves `target` of the area behind it: regula falsi
     /// with the Illinois modification (the area grows smoothly with the position), falling
     /// back to bisection when the bracket shrinks too slowly.
-    fn solve(&self, n: P2, target: f64, (mut lo, alo): (f64, f64), (mut hi, ahi): (f64, f64), buf: &mut Vec<Coord<f64>>) -> f64 {
+    fn solve(&self, n: P2, target: f64, (mut lo, alo): (f64, f64), (mut hi, ahi): (f64, f64)) -> f64 {
         // Well below the required accuracy, well above the rounding of the area sums.
         let eps = 1e-3 * area_tolerance(target);
         let (mut flo, mut fhi) = (alo - target, ahi - target);
@@ -361,7 +591,7 @@ impl Parcel {
                     break;
                 }
             }
-            let f = self.area_before(n, t, buf) - target;
+            let f = self.area_before(n, t) - target;
             if f.abs() <= eps {
                 return t;
             }
@@ -388,11 +618,10 @@ impl Parcel {
     /// The cut positions and the target area of each part (`None` where none is aimed at).
     fn cuts(&self, n: P2, plan: Plan) -> Res<(Vec<f64>, Vec<Option<f64>>)> {
         let (tmin, tmax) = self.extent(n);
-        let mut buf = Vec::new();
         let total = self.area;
         // A table of the area along the sweep brackets every cut closely, so each root takes
         // a few evaluations however many parts there are.
-        let cumulative = |targets: &[f64], buf: &mut Vec<Coord<f64>>| {
+        let cumulative = |targets: &[f64]| {
             let k = (2 * targets.len()).clamp(8, 64);
             let ts: Vec<f64> = (0..=k).map(|i| tmin + (tmax - tmin) * i as f64 / k as f64).collect();
             let fs: Vec<f64> = ts
@@ -401,7 +630,7 @@ impl Parcel {
                 .map(|(i, &t)| match i {
                     0 => 0.0,
                     i if i == k => total,
-                    _ => self.area_before(n, t, buf),
+                    _ => self.area_before(n, t),
                 })
                 .collect();
             let mut cuts: Vec<f64> = Vec::with_capacity(targets.len());
@@ -411,9 +640,9 @@ impl Parcel {
                 if let Some(&prev) = cuts.last()
                     && prev > lo.0
                 {
-                    lo = (prev, self.area_before(n, prev, buf));
+                    lo = (prev, self.area_before(n, prev));
                 }
-                cuts.push(self.solve(n, c, lo, (ts[i], fs[i]), buf));
+                cuts.push(self.solve(n, c, lo, (ts[i], fs[i])));
             }
             cuts
         };
@@ -424,14 +653,14 @@ impl Parcel {
                 }
                 let each = total / parts as f64;
                 let targets: Vec<f64> = (1..parts).map(|k| total * k as f64 / parts as f64).collect();
-                (cumulative(&targets, &mut buf), vec![Some(each); parts])
+                (cumulative(&targets), vec![Some(each); parts])
             }
             Plan::Share(s) => {
                 if !(s > 0.0 && s < 1.0) {
                     return Err("the share must be between 0 and 100 %".into());
                 }
                 let a = total * s;
-                (cumulative(&[a], &mut buf), vec![Some(a), Some(total - a)])
+                (cumulative(&[a]), vec![Some(a), Some(total - a)])
             }
             Plan::Area(a) => {
                 if !(a > 0.0) {
@@ -451,7 +680,7 @@ impl Parcel {
                 let targets: Vec<f64> = (1..=ncuts).map(|k| a * k as f64).collect();
                 let mut aims = vec![Some(a); ncuts];
                 aims.push(if rem <= tol { Some(a) } else { None });
-                (cumulative(&targets, &mut buf), aims)
+                (cumulative(&targets), aims)
             }
             Plan::Width(w) => {
                 if !(w > 0.0) {
@@ -539,34 +768,46 @@ impl Parcel {
             let t = n[0] * m.sx / m.a + n[1] * m.sy / m.a;
             strips[cuts.partition_point(|&c| c < t)].push(poly);
         }
+        let authalic = Authalic::new(self.placer.frame());
         let mut parts = Vec::with_capacity(aims.len());
         for (k, (polys, aim)) in strips.into_iter().zip(aims).enumerate() {
             let local = MultiPolygon(polys);
-            let mut m = Moments::default();
-            for (r, w) in weighted_rings(&local) {
-                m.add(Moments::of(&r).scaled(w));
-            }
-            let metric = geojson::from_polygons(
-                local.0.iter().map(|p| geo::MapCoords::map_coords(p, |c| c + self.origin)).collect(),
-            );
+            let metric_polys: Vec<Polygon<f64>> =
+                local.0.iter().map(|p| geo::MapCoords::map_coords(p, |c| c + self.origin)).collect();
+            let metric = geojson::from_polygons(metric_polys.clone());
             let mut new_vertices = Vec::new();
-            let geom = match geojson::prepare_output(self.placer.unproject_cut(&ix, &metric, &mut new_vertices)) {
+            let lonlat = self.placer.unproject_cut(&ix, &metric, &mut new_vertices);
+            // measured on what is written, independently of the model that placed the cuts
+            let area = match (self.mode, lonlat.to_multi_polygon()) {
+                (AreaMode::Ellipsoidal, Some(ll)) => authalic.area(&MultiPolygon(metric_polys), &ll),
+                _ => {
+                    let mut m = Moments::default();
+                    for (r, w) in weighted_rings(&local) {
+                        m.add(Moments::of(&r).scaled(w));
+                    }
+                    m.a
+                }
+            };
+            let geom = match geojson::prepare_output(lonlat) {
                 Ok(g) => g,
                 Err(_) if aim.is_none() => continue,
                 Err(e) => return Err(format!("part {}: {e}", k + 1)),
             };
-            parts.push(Part { geom, area: self.dens.measure(m), target: aim, new_vertices });
+            parts.push(Part { geom, area, target: aim, new_vertices });
+        }
+        // Shares of the area are shares of what the parts measure; a part of a given area
+        // keeps its target.
+        if let Plan::Equal(_) | Plan::Share(_) = plan {
+            let scale = parts.iter().map(|p| p.area).sum::<f64>() / self.area;
+            for p in &mut parts {
+                p.target = p.target.map(|t| t * scale);
+            }
         }
         Ok(parts)
     }
 }
 
 // ---------- commands ----------
-
-/// The attributes a new part inherits.
-fn inherited(props: &Map<String, Value>) -> Map<String, Value> {
-    props.iter().filter(|(k, _)| !ID_FIELDS.contains(&k.to_ascii_lowercase().as_str())).map(|(k, v)| (k.clone(), v.clone())).collect()
-}
 
 fn round4(x: f64) -> f64 {
     (x * 1e4).round() / 1e4
@@ -628,7 +869,7 @@ fn divide_selected(ctx: &Ctx, plan: Plan, keep_last: bool) -> Res<(Vec<(i64, Vec
     let mut created = 0usize;
     for (f, parts) in &done {
         let keep = if keep_last { parts.len() - 1 } else { 0 };
-        let attrs = inherited(&f.properties);
+        let attrs = host_io::inherited_attributes(&f.properties);
         for (i, p) in parts.iter().enumerate() {
             if i == keep {
                 host_io::set_geometry(layer, f.row, &p.geom)?;
@@ -790,7 +1031,7 @@ pub fn divide_parcel_tool(req: &Request) -> Res<Value> {
                 continue;
             }
         };
-        let base = f.get("properties").and_then(Value::as_object).cloned().unwrap_or_default();
+        let base = f.get("properties").and_then(Value::as_object).map(host_io::inherited_attributes).unwrap_or_default();
         for (k, p) in parts.iter().enumerate() {
             let mut props = base.clone();
             props.insert("src_id".into(), src.clone());

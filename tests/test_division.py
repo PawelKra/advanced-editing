@@ -438,10 +438,10 @@ def wavy_layer(name, count, n):
 
 
 def test_division_budget_on_both_sides():
-    # division's own estimate: 300 parcels of 21 vertices into 2 parts fit, 301 do not; into
-    # 4 parts 214 and 215; one parcel of 9604 and 9701 vertices into 2 parts
-    for count, n, parts, fits in [(301, 20, 2, False), (300, 20, 2, True), (215, 20, 4, False), (214, 20, 4, True),
-                                  (1, 9700, 2, False), (1, 9603, 2, True)]:
+    # division's own estimate: 235 parcels of 21 vertices into 2 parts fit, 236 do not; into
+    # 4 parts 160 and 161; one parcel of 8051 and 8052 vertices into 2 parts
+    for count, n, parts, fits in [(236, 20, 2, False), (235, 20, 2, True), (161, 20, 4, False), (160, 20, 4, True),
+                                  (1, 8051, 2, False), (1, 8050, 2, True)]:
         with Session(wavy_layer('parcels', count, n)) as s:
             s.activate('parcels')
             s.select('parcels', range(count))

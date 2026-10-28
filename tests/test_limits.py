@@ -284,7 +284,7 @@ def test_readme_limits_match_the_budget():
     check('%d times' % (b['TOOL_FUEL'] // b['COMMAND_FUEL']) in limits, b['TOOL_FUEL'])
     # every vertex count the README states is one of these
     stated = {int(n.replace(' ', '')) for n in re.findall(r'(\d[\d ]*\d) vertices', limits)}
-    check(stated <= {20_000, 30_000, 40_000, 3000, 9000, 20}, stated)
+    check(stated <= {20_000, 30_000, 40_000, 3000, 8000, 20}, stated)
     # no module keeps a vertex cap of its own beside the budget (the quadratic validity check
     # of small outputs is not an edit limit)
     for f in sorted((REPO / 'src').glob('*.rs')):
