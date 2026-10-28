@@ -1,0 +1,249 @@
+{
+  "id": "advanced-editing",
+  "name": "Advanced Editing",
+  "version": "0.1.0",
+  "description": "QGIS-style advanced editing: cut, clip and split with polygons and lines, rings and parts, reshape, offset curves, trim and extend, merge and exchange attributes, simplify, densify, smooth, and parcel division by area. Commands work on the selection: the selected features of the active layer are the tools, the selected features of other layers the targets.",
+  "author": "Pawel Krapiec",
+  "homepage": "https://github.com/PawelKra/advanced-editing",
+  "license": "MIT",
+  "entry": "plugin.wasm",
+  "abi": 1,
+  "minRustgisVersion": "0.4.0",
+  "permissions": ["edit"],
+  "commands": [
+    {
+      "id": "cut-with-polygon",
+      "label": "Cut With\nPolygon",
+      "help": "Removes the area of the selected polygons of the active layer (the tools) from the target polygons. Targets: the selected polygons of other layers or, when no other layer has a selection (or with \"Use whole active layer as targets\"), the active layer's polygons that overlap the tools. A target left empty is deleted. Tool vertices and edges within 1 mm of a target's vertices or edges are snapped onto them first, so a tool drawn along a boundary follows it exactly and leaves no slivers. With \"Topological editing\", the new vertices on a target's edges are also added to the features that share those edges. The tools are deleted unless \"Keep tool features\" is on.",
+      "icon": "erase",
+      "params": "{\"keepTools\"?: bool, \"wholeLayer\"?: bool, \"topological\"?: bool} (input: the selection)"
+    },
+    {
+      "id": "clip-with-polygon",
+      "label": "Clip With\nPolygon",
+      "help": "Keeps only the part of the target polygons inside the selected polygons of the active layer (the tools). Targets: the selected polygons of other layers or, when no other layer has a selection (or with \"Use whole active layer as targets\"), the active layer's polygons that overlap the tools. A selected target entirely outside the tools is deleted. Tool vertices and edges within 1 mm of a target's vertices or edges are snapped onto them first, so a tool drawn along a boundary follows it exactly and leaves no slivers. With \"Topological editing\", the new vertices on a target's edges are also added to the features that share those edges. The tools are deleted unless \"Keep tool features\" is on.",
+      "icon": "polygon_tool",
+      "params": "{\"keepTools\"?: bool, \"wholeLayer\"?: bool, \"topological\"?: bool} (input: the selection)"
+    },
+    {
+      "id": "add-ring",
+      "label": "Add Ring",
+      "help": "Punches the selected polygons of the active layer (the tools) as holes into the target polygon around each of them. Targets: the selected polygons of other layers, or the active layer's polygons touching the tools. A tool that crosses, overlaps or runs along a target's outline or another hole is skipped; one that touches them only at single points becomes a hole (a valid polygon). The tools that became holes are deleted unless \"Keep tool features\" is on.",
+      "icon": "polygon_tool",
+      "params": "{\"keepTools\"?: bool, \"wholeLayer\"?: bool} (input: the selection)"
+    },
+    {
+      "id": "delete-ring",
+      "label": "Delete Ring",
+      "help": "Removes the holes of the selected polygons of the active layer (of all its polygons with \"Use whole active layer as targets\"). Selected features (points, lines or polygons) in other layers limit it to the holes they touch.",
+      "icon": "delete",
+      "params": "{\"wholeLayer\"?: bool} (input: the selection)"
+    },
+    {
+      "id": "fill-ring",
+      "label": "Fill Ring",
+      "help": "Fills the holes of the selected polygons of the active layer (of all its polygons with \"Use whole active layer as targets\") with new polygons that copy the attributes of the polygon around them; the holes stay. Islands lying in a hole (other parts of the same feature, other polygons of the layer) stay out of the new polygon; a hole that islands cover entirely is not filled. Selected features (points, lines or polygons) in other layers limit it to the holes they touch.",
+      "icon": "polygon_layer",
+      "params": "{\"wholeLayer\"?: bool} (input: the selection)"
+    },
+    {
+      "id": "add-part",
+      "label": "Add Part",
+      "help": "Adds the selected polygons of the active layer (the tools) as new parts of one target polygon: the polygon selected in another layer, or the active layer's polygon they touch. Overlapping or touching parts are merged. The tools are deleted unless \"Keep tool features\" is on.",
+      "icon": "create",
+      "params": "{\"keepTools\"?: bool, \"wholeLayer\"?: bool} (input: the selection)"
+    },
+    {
+      "id": "delete-part",
+      "label": "Delete Part",
+      "help": "Deletes parts of the selected multi-part polygons of the active layer: every part except the largest, or only the parts that the selected features of other layers touch. The last part is never deleted.",
+      "icon": "delete",
+      "params": "{} (input: the selection)"
+    },
+    {
+      "id": "split-off-part",
+      "label": "Split Off\nPart",
+      "help": "Moves parts of the selected multi-part polygons of the active layer into new features with the same attributes: every part except the largest, or only the parts that the selected features of other layers touch (the largest stays when they touch every part).",
+      "icon": "polygon_layer",
+      "params": "{} (input: the selection)"
+    },
+    {
+      "id": "fill-gap",
+      "label": "Fill Gap",
+      "help": "Adds each gap enclosed by the selected polygons of the active layer (by all its polygons with \"Use whole active layer as targets\") as a new polygon without attributes. Gaps open to the outside, holes of a single polygon (use Fill Ring for those) and slivers under 0.01 m² or narrower than 1 cm are not filled.",
+      "icon": "measure_area",
+      "params": "{\"wholeLayer\"?: bool} (input: the selection)"
+    },
+    {
+      "id": "split-with-line",
+      "label": "Split With\nLine",
+      "help": "Splits the target polygons or lines with the selected line(s) of the active layer (the tools). Targets: the selected features of other layers or, when no other layer has a selection (or with \"Use whole active layer as targets\"), the active layer's features the lines touch. A target is split where a line crosses it from side to side, and a closed line inside a polygon cuts out the area it encloses: the largest piece keeps the feature, the others become new features with its attributes. Tool vertices and edges within 1 mm of a target's vertices or edges are snapped onto them first, so a tool drawn along a boundary follows it exactly and leaves no slivers. With \"Topological editing\", the new vertices on a target's edges are also added to the features that share those edges. The tools are deleted unless \"Keep tool features\" is on.",
+      "icon": "line_tool",
+      "params": "{\"keepTools\"?: bool, \"wholeLayer\"?: bool, \"topological\"?: bool} (input: the selection)"
+    },
+    {
+      "id": "reshape",
+      "label": "Reshape",
+      "help": "Reshapes the target polygons or lines along the one selected line of the active layer (the tool), which must cross the target's outline (or one hole or part) at least twice: the stretch between the first and last crossing is replaced by the line. Of a polygon the larger side is kept, as in QGIS; a line that would cut the polygon in two (reaching the opposite side inside it) is refused: use Split With Line for that. A line target is replaced between the first and last crossing, or extended by a tool line that starts or ends at one of its end points. Targets: the selected features of other layers, or the active layer's features the line touches. The tools are deleted unless \"Keep tool features\" is on.",
+      "icon": "line_tool",
+      "params": "{\"keepTools\"?: bool, \"wholeLayer\"?: bool} (input: the selection)"
+    },
+    {
+      "id": "offset",
+      "label": "Offset\nCurve",
+      "help": "Offsets the selected lines or polygons of the active layer by the panel's Distance: lines to the right of their direction (left with \"Offset to the left\"), polygons outwards (inwards with \"Offset to the left\"). Adds the result as a copy with the same attributes, or replaces the original with \"Move instead of copy\".",
+      "icon": "buffer",
+      "params": "{\"distance\"?: metres, \"left\"?: bool, \"move\"?: bool} (input: the selection)"
+    },
+    {
+      "id": "trim-extend",
+      "label": "Trim/\nExtend",
+      "help": "Trims or extends the target lines to meet the one selected line or polygon of the active layer (the boundary). The end nearest to the boundary is cut back to the crossing nearest to it or, when the line does not cross it, extended along its last segment however far the boundary is, as in QGIS. Targets: the selected lines of other layers (extended without a length limit) or, when no other layer has a selection (or with \"Use whole active layer as targets\"), the lines of the active layer that cross the boundary or point at it with their nearest end within the panel's Distance of it (a search radius). Lines already touching it are left alone.",
+      "icon": "line_layer",
+      "params": "{\"distance\"?: metres (search radius), \"wholeLayer\"?: bool} (input: the selection)"
+    },
+    {
+      "id": "merge-with-attributes",
+      "label": "Merge With\nAttributes",
+      "help": "Merges the selected features of the active layer into one: polygons are unioned; lines that run over each other are dissolved so the shared stretch is kept once, then joined where their ends meet. The merged feature keeps the id and attributes of the largest one (by area or length; ties: the lowest id); the others are deleted. With \"Sum numbers when merging\" each numeric field except id, fid and ogc_fid gets the sum over the merged features (nulls count as 0; a field null in all of them stays null).",
+      "icon": "table",
+      "params": "{\"sum\"?: bool} (input: the selection)"
+    },
+    {
+      "id": "exchange-attributes",
+      "label": "Exchange\nAttributes",
+      "help": "Swaps all field values of the two selected features of the active layer; their ids and geometries stay.",
+      "icon": "calculate",
+      "params": "{} (input: the selection)"
+    },
+    {
+      "id": "copy-move",
+      "label": "Copy/Move",
+      "help": "Copies the selected features of the active layer by the panel's Distance towards its Bearing (a grid bearing of EPSG:2180 (UTM outside Poland), not geographic north), with the same attributes, or moves them with \"Move instead of copy\".",
+      "icon": "create",
+      "params": "{\"distance\"?: metres, \"bearing\"?: degrees clockwise from grid north, \"move\"?: bool} (input: the selection)"
+    },
+    {
+      "id": "simplify",
+      "label": "Simplify",
+      "help": "Simplifies the selected lines or polygons of the active layer (all of them with \"Use whole active layer as targets\"), removing vertices closer than the panel's Tolerance to the simplified shape. A feature that would collapse or turn invalid is left as it is. Each feature is edited on its own: boundaries shared with neighbours can open gaps or overlaps.",
+      "icon": "line_layer",
+      "params": "{\"tolerance\"?: metres, \"wholeLayer\"?: bool} (input: the selection)"
+    },
+    {
+      "id": "densify",
+      "label": "Densify",
+      "help": "Adds vertices to the selected lines or polygons of the active layer (all of them with \"Use whole active layer as targets\") so that no segment is longer than the panel's Distance. The shapes do not change.",
+      "icon": "line_layer",
+      "params": "{\"distance\"?: metres, \"wholeLayer\"?: bool} (input: the selection)"
+    },
+    {
+      "id": "smooth",
+      "label": "Smooth",
+      "help": "Smooths the selected lines or polygons of the active layer (all of them with \"Use whole active layer as targets\") by corner cutting, repeated the panel's Smoothing iterations times; line ends stay. A polygon whose rings would cross is left as it is. Each feature is edited on its own: boundaries shared with neighbours can open gaps or overlaps.",
+      "icon": "line_layer",
+      "params": "{\"iterations\"?: 1-10, \"wholeLayer\"?: bool} (input: the selection)"
+    },
+    {
+      "id": "divide-equal",
+      "label": "Divide Into\nEqual Parts",
+      "help": "Divides each selected polygon of the active layer into the panel's Parts number of parts of equal ellipsoidal area, with parallel cut lines in the panel's Division direction (a grid bearing of EPSG:2180 (UTM outside Poland), not geographic north). The first part keeps the feature, the others become new features with its attributes. Parts are numbered from the west (0°) or north (90°); with \"Divide from the other side\" from the east or south. A script's parts outside 2–1000 or not a whole number are refused. New vertices lie exactly on the polygon's edges; with \"Topological editing\" they are also added to the features that share those edges.",
+      "icon": "measure_area",
+      "params": "{\"parts\"?: whole number 2–1000, \"angle\"?: degrees clockwise from grid north, \"reverse\"?: bool} (input: the selection)"
+    },
+    {
+      "id": "divide-percent",
+      "label": "Cut Off\nPercent",
+      "help": "Cuts the panel's Cut-off share (percent of the ellipsoidal area) off each selected polygon of the active layer with a line in the panel's Division direction (a grid bearing of EPSG:2180 (UTM outside Poland), not geographic north), as a new feature with the original's attributes; the rest keeps the feature. The cut-off share is on the west (0°) or north (90°) side; with \"Divide from the other side\" on the east or south. A script's percent of 0 or less, or 100 or more, is refused. New vertices lie exactly on the polygon's edges; with \"Topological editing\" they are also added to the features that share those edges.",
+      "icon": "measure_area",
+      "params": "{\"percent\"?: number greater than 0 and less than 100, fractions allowed, \"angle\"?: degrees clockwise from grid north, \"reverse\"?: bool} (input: the selection)"
+    },
+    {
+      "id": "panel-state",
+      "label": "Refresh Panel",
+      "help": "Shows the Advanced Editing panel's settings. Runs by itself when the panel opens.",
+      "icon": "tools",
+      "params": "{}"
+    }
+  ],
+  "tools": [
+    {
+      "id": "divide-parcel",
+      "name": "Divide Parcel",
+      "summary": "Proposes a division of parcels into parts of equal area, of a given area or of a given width, as a new layer with each part's source id, number and area; the parcels themselves are not changed.",
+      "toolbox": "Advanced Editing",
+      "params": [
+        { "name": "input", "label": "Parcels", "kind": "polygonLayer", "required": true, "help": "The parcels to divide; only the selected ones when the layer has a selection." },
+        { "name": "mode", "label": "Division", "kind": "choice", "choices": ["Equal parts", "Parts of given area", "Strips of given width"], "default": "Equal parts", "help": "Equal parts: Count parts of the same area. Parts of given area: parts of Area each, the remainder last. Strips of given width: strips Width wide (on the ground with Ellipsoidal area, in the plane with Planar), the remainder last. Parts are numbered from the west (0°) or north (90°)." },
+        { "name": "count", "label": "Count", "kind": "number", "default": 2, "help": "Number of parts (Equal parts): a whole number from 2 to 10000." },
+        { "name": "area", "label": "Area (m²)", "kind": "number", "default": 1000, "help": "Area of each part in square metres (Parts of given area)." },
+        { "name": "width", "label": "Width (m)", "kind": "number", "default": 20, "help": "Strip width in metres, measured across the division lines (Strips of given width)." },
+        { "name": "angle", "label": "Direction (°)", "kind": "number", "default": 0, "help": "Direction of the division lines in degrees clockwise, a grid bearing of EPSG:2180 (UTM outside Poland), not geographic north: 0 = north-south lines, 90 = east-west lines." },
+        { "name": "areaMode", "label": "Area", "kind": "choice", "choices": ["Ellipsoidal", "Planar"], "default": "Ellipsoidal", "help": "Ellipsoidal: true area on the GRS80 ellipsoid (cadastral). Planar: area in the EPSG:2180 / UTM plane." },
+        { "name": "reverse", "label": "Start from the other side", "kind": "bool", "default": false, "help": "Number the parts (and put the remainder) from the right of the division direction: from the east instead of the west, from the south instead of the north." }
+      ]
+    }
+  ],
+  "tab": {
+    "label": "Advanced Editing",
+    "groups": [
+      {
+        "label": "Polygons",
+        "items": [
+          "cut-with-polygon",
+          "clip-with-polygon",
+          { "menu": "Rings", "icon": "polygon_tool", "help": "Add, delete or fill polygon holes.", "items": ["add-ring", "delete-ring", "fill-ring"] },
+          { "menu": "Parts", "icon": "polygon_layer", "help": "Add, delete or split off parts of multi-part features.", "items": ["add-part", "delete-part", "split-off-part"] },
+          "fill-gap"
+        ]
+      },
+      {
+        "label": "Lines",
+        "items": ["split-with-line", "reshape", "offset", "trim-extend"]
+      },
+      {
+        "label": "Attributes & Cleanup",
+        "items": [
+          "merge-with-attributes",
+          "exchange-attributes",
+          "copy-move",
+          { "menu": "Generalize", "icon": "line_layer", "help": "Simplify, densify or smooth the selected features.", "items": ["simplify", "densify", "smooth"] }
+        ]
+      },
+      {
+        "label": "Division",
+        "items": ["divide-equal", "divide-percent", "tool:divide-parcel", "panel"]
+      }
+    ]
+  },
+  "panel": {
+    "title": "Advanced Editing",
+    "icon": "tools",
+    "help": "Settings for the Advanced Editing commands. Select the tool features in the active layer and the targets in other layers, then run a command.",
+    "state": "panel-state",
+    "items": [
+      { "kind": "text", "id": "status", "label": "Last result", "text": "Select features, then run a command." },
+      { "kind": "slider", "id": "distance", "label": "Distance", "min": 0, "max": 24, "default": 7, "steps": true, "help": "In metres: the offset of Offset Curve, the shift of Copy/Move and the longest segment Densify leaves; for Trim/Extend, the search radius when no target lines are selected." },
+      { "kind": "slider", "id": "tolerance", "label": "Tolerance", "min": 0, "max": 15, "default": 6, "steps": true, "help": "Used by Simplify, in metres: vertices closer than this to the simplified shape are removed." },
+      { "kind": "slider", "id": "iterations", "label": "Smoothing iterations", "min": 1, "max": 5, "default": 2, "steps": true, "help": "Used by Smooth: how many times it cuts the corners; each pass doubles the vertices." },
+      { "kind": "slider", "id": "parts", "label": "Parts", "min": 2, "max": 50, "default": 2, "steps": true, "help": "Used by Divide Into Equal Parts: the number of equal-area parts." },
+      { "kind": "slider", "id": "percent", "label": "Cut-off share (%)", "min": 1, "max": 99, "default": 50, "steps": true, "help": "Used by Cut Off Percent: the percent of each polygon's area it cuts off." },
+      { "kind": "slider", "id": "angle", "label": "Division direction (°)", "min": 0, "max": 179, "default": 0, "steps": true, "help": "Used by Divide Into Equal Parts and Cut Off Percent: the direction of the cut lines in degrees clockwise, a grid bearing of EPSG:2180 (UTM outside Poland), not geographic north. 0 = north-south lines, 90 = east-west lines." },
+      { "kind": "slider", "id": "bearing", "label": "Bearing (°)", "min": 0, "max": 359, "default": 90, "steps": true, "help": "Used by Copy/Move: the direction of the shift in degrees clockwise, a grid bearing of EPSG:2180 (UTM outside Poland). 0 = north, 90 = east." },
+      { "kind": "checkbox", "id": "keep-tools", "label": "Keep tool features", "default": true, "help": "Used by Cut With Polygon, Clip With Polygon, Add Ring, Add Part, Split With Line and Reshape: keeps the tool features (the selection in the active layer); off deletes them." },
+      { "kind": "checkbox", "id": "offset-left", "label": "Offset to the left", "help": "Used by Offset Curve: lines go to the left of their direction and polygons shrink; off: to the right, and polygons grow." },
+      { "kind": "checkbox", "id": "move-original", "label": "Move instead of copy", "help": "Used by Copy/Move and Offset Curve: they change the selected features instead of adding copies." },
+      { "kind": "checkbox", "id": "merge-sum", "label": "Sum numbers when merging", "help": "Merge With Attributes sets each numeric field to the sum over the merged features." },
+      { "kind": "checkbox", "id": "divide-reverse", "label": "Divide from the other side", "help": "Parts start (and Cut Off Percent cuts) on the right of the division direction instead of the left: east instead of west, south instead of north." },
+      { "kind": "checkbox", "id": "topological", "label": "Topological editing", "default": true, "help": "When a command adds a vertex on an edge shared with a feature that isn't being edited (in the edited layers, and in the other visible layers of the same geometry type), the same vertex is added to that feature too, so shared boundaries stay identical." },
+      { "kind": "checkbox", "id": "whole-layer", "label": "Use whole active layer as targets", "help": "Delete Ring, Fill Ring, Fill Gap, Simplify, Densify and Smooth edit all features of the active layer instead of its selection. Cut, Clip, Add Ring, Add Part, Split With Line, Reshape and Trim/Extend take their targets from the active layer even when other layers have a selection. A command reads about 1.2 MB of features; larger layers need a selection." },
+      { "kind": "button", "command": "offset" },
+      { "kind": "button", "command": "copy-move" },
+      { "kind": "button", "command": "simplify" },
+      { "kind": "button", "command": "densify" },
+      { "kind": "button", "command": "smooth" },
+      { "kind": "button", "command": "divide-equal" },
+      { "kind": "button", "command": "divide-percent" }
+    ]
+  }
+}

@@ -1,0 +1,4 @@
+# The plugin only exists as a WebAssembly module: a bare `cargo build` targets it too,
+# so no native binary of the crate is ever produced.
+[build]
+target = "wasm32-unknown-unknown"

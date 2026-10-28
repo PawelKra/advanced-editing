@@ -1,0 +1,292 @@
+"""What one command can afford (host_io::budget) and the fast shared paths it relies on:
+the projection, VertexSnap, and reading/writing GeoJSON text without a Value tree."""
+
+import math
+from decimal import Decimal, getcontext
+
+from aelib import (ABROAD, PL, Session, check, feature, linestring, offset_m, point, polygon, rect,
+                   write_layer)
+
+
+def blob(cx, cy, r, n, origin=PL):
+    """A closed wavy ring of n vertices around (cx, cy) metres from `origin`."""
+    lon, lat = origin
+    ring = []
+    for i in range(n):
+        t = i * math.tau / n
+        rr = r * (1 + 0.02 * math.sin(7 * t))
+        ring.append(offset_m(lon, lat, cx + rr * math.cos(t), cy + rr * math.sin(t)))
+    ring.append(ring[0])
+    return ring
+
+
+def blob_layer(name, k, n):
+    return write_layer(name, [feature(polygon(blob(300 * i, 0, 100, n)), n=i) for i in range(k)])
+
+
+def cutter_layer(k):
+    lon, lat = PL
+    return write_layer('cutter', [feature(polygon(rect(lon, lat, 300 * k, 60, -150, -30)), name='cut')])
+
+
+def test_edit_guard_refuses_just_over_and_changes_nothing():
+    # 5 x 4201 = 21 005 vertices: just over the ~20 800 a command edits
+    with Session(blob_layer('blobs', 5, 4200), cutter_layer(5)) as s:
+        s.activate('blobs')
+        s.select('blobs', range(5))
+        before = s.features('blobs')
+        e = s.error_of('simplify', {'tolerance': 0.5})
+        check('This would edit 5 features with 21 005 vertices; one command handles about 20 000 vertices. '
+              'Select fewer features' in e, e)
+        # tool commands count the tools too
+        s.activate('cutter')
+        s.select('cutter', [0], add=True)
+        e = s.error_of('cut-with-polygon', {'keepTools': True})
+        check('This would edit 5 features with 21 010 vertices' in e, e)
+        check(s.features('blobs') == before, 'a refused command changed the data')
+
+
+def test_big_selection_within_the_guard_succeeds():
+    # 4 x 5001 vertices: read, projected, cut and written in one command
+    with Session(blob_layer('blobs', 4, 5000), cutter_layer(4)) as s:
+        s.select('blobs', range(4))
+        s.activate('cutter')
+        s.select('cutter', [0], add=True)
+        r = s.plugin('cut-with-polygon', {'keepTools': True})
+        check('Cut 4' in r['message'], r)
+        check(all(f['geometry']['type'] == 'MultiPolygon' for f in s.features('blobs')))
+        s.activate('blobs')
+        s.select('blobs', range(4))
+        r = s.plugin('smooth', {'iterations': 1})
+        check('Smoothed 4' in r['message'], r)
+
+
+def test_read_guard_refuses_a_large_reply():
+    # 35 x 1001 vertices ~ 1.4 MB of GeoJSON: more than a command parses
+    with Session(blob_layer('blobs', 35, 1000)) as s:
+        s.activate('blobs')
+        s.select('blobs', [0])
+        e = s.error_of('diag-selection', {'mode': 'edit', 'dims': ['polygon'], 'whole': True})
+        check("Reading the 35 features of 'blobs' means 1.4 MB of data; one command reads about 1.2 MB. "
+              'Select fewer features.' in e, e)
+        # the selection alone is fine
+        r = s.plugin('diag-selection', {'mode': 'edit', 'dims': ['polygon']})
+        check(r['ids'] == [1], r)
+
+
+# ---------- projection ----------
+
+getcontext().prec = 45
+_PI = Decimal('3.14159265358979323846264338327950288419716939937510582097494459')
+_TINY = Decimal('1e-55')
+
+
+def _exp(x):
+    k = 0
+    while abs(x) > Decimal('0.5'):
+        x /= 2
+        k += 1
+    s = t = Decimal(1)
+    i = 1
+    while abs(t) > _TINY:
+        t = t * x / i
+        i += 1
+        s += t
+    for _ in range(k):
+        s *= s
+    return s
+
+
+def _ln(x):
+    y = Decimal(repr(math.log(float(x))))
+    for _ in range(4):
+        e = _exp(y)
+        y += 2 * (x - e) / (x + e)
+    return y
+
+
+def _sin(x):
+    x = x % (2 * _PI)
+    s = t = x
+    i = 1
+    while abs(t) > _TINY:
+        t = -t * x * x / ((2 * i) * (2 * i + 1))
+        i += 1
+        s += t
+    return s
+
+
+def _cos(x):
+    return _sin(x + _PI / 2)
+
+
+def _atan(x):
+    k = 0
+    while abs(x) > Decimal('0.1'):
+        x = x / (1 + (1 + x * x).sqrt())
+        k += 1
+    s = t = x
+    i = 1
+    while abs(t) > _TINY:
+        t = -t * x * x
+        s += t / (2 * i + 1)
+        i += 1
+    return s * 2 ** k
+
+
+def tm_exact(inv_f, lon0, k0, fn, lon, lat):
+    """The Krueger n^6 series with the exact conformal latitude, in 45-digit arithmetic."""
+    f = 1 / Decimal(inv_f)
+    n = f / (2 - f)
+    alp = [n / 2 - 2 * n**2 / 3 + 5 * n**3 / 16 + 41 * n**4 / 180 - 127 * n**5 / 288 + 7891 * n**6 / 37800,
+           13 * n**2 / 48 - 3 * n**3 / 5 + 557 * n**4 / 1440 + 281 * n**5 / 630 - 1983433 * n**6 / 1935360,
+           61 * n**3 / 240 - 103 * n**4 / 140 + 15061 * n**5 / 26880 + 167603 * n**6 / 181440,
+           49561 * n**4 / 161280 - 179 * n**5 / 168 + 6601661 * n**6 / 7257600,
+           34729 * n**5 / 80640 - 3418889 * n**6 / 1995840,
+           212378941 * n**6 / 319334400]
+    a_rect = Decimal(6378137) / (1 + n) * (1 + n**2 / 4 + n**4 / 64 + n**6 / 256)
+    e = (f * (2 - f)).sqrt()
+    phi = Decimal(repr(lat)) * _PI / 180
+    lam = (Decimal(repr(lon)) - lon0) * _PI / 180
+    sp = _sin(phi)
+    z = e * sp
+    sig = _exp(e * _ln((1 + z) / (1 - z)) / 2)
+    sig = (sig - 1 / sig) / 2
+    tau = sp / _cos(phi)
+    taup = tau * (1 + sig * sig).sqrt() - sig * (1 + tau * tau).sqrt()
+    cl, sl = _cos(lam), _sin(lam)
+    xip = _atan(taup / cl)
+    q = sl / (taup * taup + cl * cl).sqrt()
+    etap = _ln(q + (q * q + 1).sqrt())
+    xi, eta = xip, etap
+    for j, a in enumerate(alp):
+        k = 2 * (j + 1)
+        ek = _exp(k * etap)
+        xi += a * _sin(k * xip) * (ek + 1 / ek) / 2
+        eta += a * _cos(k * xip) * (ek - 1 / ek) / 2
+    kk = Decimal(k0) * a_rect
+    return float(500000 + kk * eta), float(Decimal(fn) + kk * xi)
+
+
+def test_projection_accuracy():
+    with Session() as s:
+        # the fast projection against the term-by-term one it replaced, on dense grids
+        for lon, lat in [(19, 52), (10.5, 45.5), (-70, -33), (150, 60), (20, 80), (3, 0.5)]:
+            r = s.plugin('diag-proj', {'grid': True, 'n': 30, 'lon': lon, 'lat': lat})
+            check(max(r['fwd_m'], r['inv_m'], r['rt_m']) < 1e-8, r)
+        # and against the series evaluated exactly: within 3 nm (a few ulps of the northing)
+        pts = [(14.1, 49.1), (24.1, 54.8), (21.0122, 52.2297), (16.123456789, 53.987654321),
+               (10.5, 45.5), (8.9, 45.1), (-70.0, -33.0), (150.0, 60.0), (23.9, 79.0)]
+        out = s.plugin('diag-proj', {'points': pts})['points']
+        for (lon, lat), o in zip(pts, out):
+            if o['frame'] == 'EPSG:2180':
+                x, y = tm_exact('298.257222101', 19, '0.9993', -5300000, lon, lat)
+            else:
+                zone = int(o['frame'].split()[1][:-1])
+                x, y = tm_exact('298.257223563', zone * 6 - 183, '0.9996',
+                                10000000 if o['frame'].endswith('S') else 0, lon, lat)
+            check(math.hypot(o['x'] - x, o['y'] - y) < 3e-9, (lon, lat, o, x, y))
+            check(o['rt_err_deg'] < 1e-13, o)
+
+
+def test_vertex_snap_regressions():
+    lon, lat = PL
+    with Session() as s:
+        # 5001 vertices round-trip in one command, every one bit-exact
+        r = s.plugin('diag-snap', {'geometry': polygon(blob(0, 0, 100, 5000))})
+        check(r['n'] == 5001 and r['exact'] == 5001, r)
+        # holes, several parts, shared vertices between parts, a UTM frame
+        outer = rect(lon, lat, 100, 100)
+        hole = list(reversed(rect(lon, lat, 40, 40, 30, 30)))
+        touching = rect(lon, lat, 100, 100, 100, 0)
+        mp = {'type': 'MultiPolygon', 'coordinates': [[outer, hole], [touching]]}
+        r = s.plugin('diag-snap', {'geometry': mp})
+        check(r['exact'] == r['n'] == 15, r)
+        r = s.plugin('diag-snap', {'geometry': polygon(blob(0, 0, 50, 300, origin=ABROAD))})
+        check(r['frame'] == 'UTM 32N' and r['exact'] == r['n'] == 301, r)
+        # a vertex moved within the tolerance snaps back; beyond it, it stays moved
+        for nudge, exact in [(9e-6, 301), (2e-5, 299)]:
+            r = s.plugin('diag-snap', {'geometry': polygon(blob(0, 0, 50, 300)), 'nudge': nudge})
+            check(r['exact'] == exact, (nudge, r))
+
+
+def test_number_text_is_shortest_and_exact():
+    with Session() as s:
+        r = s.plugin('diag-geojson', {'numbers': True, 'count': 1000})
+        check(r['n'] == 13000 and r['text_diff'] == 0 and r['parse_diff'] == 0, r)
+
+
+def test_geojson_text_reader_and_writer():
+    lon, lat = PL
+    sq = rect(lon, lat, 100, 100)
+    hole = list(reversed(rect(lon, lat, 40, 40, 30, 30)))
+    polys = write_layer('polys', [
+        feature(polygon(sq, hole), name='with "hole" é\\'),
+        feature({'type': 'MultiPolygon', 'coordinates': [[blob(400, 0, 50, 97)], [rect(lon, lat, 10, 10, 600, 0)]]},
+                name='multi', v=None, x=1.5e-7),
+    ])
+    lines = write_layer('lines', [
+        feature(linestring(lon, lat, [(0, 0), (10.123, 5), (20, -3)]), name='l'),
+        feature({'type': 'MultiLineString', 'coordinates': [linestring(lon, lat, [(0, 50), (9, 51)])['coordinates'],
+                                                             linestring(lon, lat, [(0, 60), (9, 61)])['coordinates']]},
+                name='ml'),
+    ])
+    pts = write_layer('pts', [
+        feature(point(lon, lat, 1, 2), name='p'),
+        feature({'type': 'MultiPoint', 'coordinates': [offset_m(lon, lat, 3, 4), offset_m(lon, lat, 5, 6)]}, name='mp'),
+    ])
+    with Session(polys, lines, pts) as s:
+        for name in ['polys', 'lines', 'pts']:
+            lid = s.layer_id(name)
+            exported = s.features(name)
+            r = s.plugin('diag-features', {'layer': lid, 'properties': True})
+            check(r['geometries'] == [f['geometry'] for f in exported], name)
+            check(r['props'] == [f['properties'] for f in exported], (r['props'], exported))
+            # written back unchanged: the host stores the very same numbers
+            s.plugin('diag-features', {'layer': lid, 'rewrite': True})
+            check(s.features(name) == exported, 'rewriting %s changed it' % name)
+
+
+# ---------- limits in the README ----------
+
+def budget_constants():
+    """The numeric constants of host_io::budget, evaluated (they are products and sums of
+    literals and each other)."""
+    import re
+    from aelib import REPO
+    src = (REPO / 'src' / 'host_io.rs').read_text()
+    body = src[src.index('pub mod budget'):]
+    env = {}
+    for name, expr in re.findall(r'pub const (\w+): (?:u64|usize) = ([^;]+);', body):
+        expr = re.sub(r'\bas \w+', '', expr).replace('/', '//')
+        expr = re.sub(r'(?<=\d)_(?=\d)', '', expr)
+        env[name] = eval(re.sub(r'\b[A-Z][A-Z0-9_]+\b', lambda m: str(env[m.group(0)]), expr))
+    return env
+
+
+def test_readme_limits_match_the_budget():
+    import re
+    from aelib import REPO
+    b = budget_constants()
+    readme = (REPO / 'README.md').read_text()
+    limits = readme[readme.index('## Limits'):readme.index('## Permissions')]
+
+    def about(n):
+        m = 1
+        while n // m >= 100:
+            m *= 10
+        return '{:,}'.format(n // m * m).replace(',', ' ')
+
+    check(b['MAX_EDIT_VERTICES'] // 1000 == 20 and 'edits about %s vertices' % about(b['MAX_EDIT_VERTICES']) in limits,
+          (b['MAX_EDIT_VERTICES'], limits))
+    check(b['MAX_WRITE_VERTICES'] // 1000 == 41 and 'about 40 000 vertices they create' in limits, b['MAX_WRITE_VERTICES'])
+    check('about %.1f MB' % (b['MAX_READ_BYTES'] / 1e6) in limits, b['MAX_READ_BYTES'])
+    check('%d times' % (b['TOOL_FUEL'] // b['COMMAND_FUEL']) in limits, b['TOOL_FUEL'])
+    # every vertex count the README states is one of these
+    stated = {int(n.replace(' ', '')) for n in re.findall(r'(\d[\d ]*\d) vertices', limits)}
+    check(stated <= {20_000, 30_000, 40_000, 3000, 9000, 20}, stated)
+    # no module keeps a vertex cap of its own beside the budget (the quadratic validity check
+    # of small outputs is not an edit limit)
+    for f in sorted((REPO / 'src').glob('*.rs')):
+        for name in re.findall(r'const (\w*VERTICES\w*): usize = \d', f.read_text()):
+            check(name == 'MAX_VALIDATE_VERTICES', '%s: %s' % (f.name, name))

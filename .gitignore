@@ -1,0 +1,6 @@
+target/
+pkg/
+*.rgplugin
+__pycache__/
+pkg-diag/
+.DS_Store
