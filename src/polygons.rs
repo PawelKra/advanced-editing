@@ -12,9 +12,7 @@
 
 use std::collections::HashMap;
 
-use geo::{
-    Area, BooleanOps, BoundingRect, Buffer, Intersects, LineString, MultiPolygon, Polygon, Rect, Winding, unary_union,
-};
+use geo::{Area, BoundingRect, Buffer, Intersects, LineString, MultiPolygon, Polygon, Rect, Winding};
 use i_overlay::core::fill_rule::FillRule;
 use i_overlay::core::overlay_rule::OverlayRule;
 use i_overlay::core::solver::Solver;
@@ -25,7 +23,8 @@ use crate::Ctx;
 use crate::geojson::{self, Dim, Geom, P2, bboxes_intersect, contours, from_polygons, prepare_output, shape_to_polygon};
 use crate::host_io::budget::{self, Meter};
 use crate::host_io::{self, Feature, LAYER_READ_CAP, LayerInfo, Res};
-use crate::proj::{SNAP_TOL_M, VertexSnap};
+use crate::lines::{PROJECT_FUEL_PER_VERTEX, SCAN_FUEL_PER_BOX, buffer_fuel};
+use crate::proj::{Frame, SNAP_TOL_M, VertexSnap};
 use crate::selection::{self, EditSpec, ToolSpec};
 use crate::topo;
 
@@ -121,7 +120,7 @@ fn boolean(a: &MultiPolygon<f64>, b: &MultiPolygon<f64>, rule: OverlayRule, solv
     MultiPolygon(shapes.iter().map(|s| shape_to_polygon(s)).collect())
 }
 
-/// The union of `ps` as geo's [`unary_union`] does it (filled by the winding of the first
+/// The union of `ps` as geo's [`geo::unary_union`] does it (filled by the winding of the first
 /// ring that has one, OGC output), with `solver`.
 fn union_of(ps: &[Polygon<f64>], solver: Solver) -> MultiPolygon<f64> {
     let rings = || ps.iter().flat_map(|p| std::iter::once(p.exterior()).chain(p.interiors()));
@@ -132,6 +131,86 @@ fn union_of(ps: &[Polygon<f64>], solver: Solver) -> MultiPolygon<f64> {
     let paths: Vec<Vec<P2>> = ps.iter().flat_map(contours).collect();
     let shapes = FloatOverlay::with_subj_custom(&paths, OverlayOptions::ogc(), solver).overlay(OverlayRule::Subject, fill);
     MultiPolygon(shapes.iter().map(|s| shape_to_polygon(s)).collect())
+}
+
+/// `a` combined with `b` by `rule` (see [`boolean`]), once `fuel` is charged for it (see
+/// [`overlay_fuel`]).
+pub(crate) fn metered_boolean(
+    a: &MultiPolygon<f64>,
+    b: &MultiPolygon<f64>,
+    rule: OverlayRule,
+    fuel: &mut Meter,
+) -> Res<MultiPolygon<f64>> {
+    let (ax, bx) = (XRanges::of_polygons(&a.0), XRanges::of_polygons(&b.0));
+    let (segments, pairs) = (ax.len() + bx.len(), ax.pairs + bx.pairs + ax.with(&bx));
+    fuel.spend(ax.fuel() + bx.fuel())?;
+    let crossings = crossings_of(a.0.iter().chain(&b.0), pairs, fuel)?;
+    fuel.spend(overlay_fuel(segments, pairs, crossings))?;
+    Ok(boolean(a, b, rule, solver_for(segments, pairs)))
+}
+
+/// The union of `ps` (see [`union_of`]), once `fuel` is charged for it.
+pub(crate) fn metered_union(ps: &[Polygon<f64>], fuel: &mut Meter) -> Res<MultiPolygon<f64>> {
+    let x = XRanges::of_polygons(ps);
+    fuel.spend(x.fuel())?;
+    let crossings = crossings_of(ps.iter(), x.pairs, fuel)?;
+    fuel.spend(overlay_fuel(x.len(), x.pairs, crossings))?;
+    Ok(union_of(ps, solver_for(x.len(), x.pairs)))
+}
+
+/// Fuel per segment sorted and per pair of segments compared by [`crossings_of`].
+const CROSSING_FUEL_PER_SEGMENT: u64 = 3_000;
+const CROSSING_FUEL_PER_PAIR: u64 = 100;
+
+/// How many times the rings of `ps` cross each other and themselves (properly: touching and
+/// overlapping do not count) beyond once per segment, charging `fuel` as it counts them. The
+/// fuel per segment and pair of [`overlay_fuel`] covers the first: a comb whose teeth each
+/// cross a square's edge twice takes no more than those, a grid of bars crossing each other at
+/// every bar does. It compares every two segments whose ranges overlap along x (`x_pairs` of
+/// them, see [`XRanges`]) or along y, whichever axis the segments' lengths along it fill fewer
+/// times over: a comb's teeth overlap along x only.
+fn crossings_of<'a>(ps: impl Iterator<Item = &'a Polygon<f64>>, x_pairs: u64, fuel: &mut Meter) -> Res<u64> {
+    let mut segs: Vec<[P2; 2]> = ps
+        .flat_map(|p| std::iter::once(p.exterior()).chain(p.interiors()))
+        .flat_map(|r| r.lines().map(|l| [[l.start.x, l.start.y], [l.end.x, l.end.y]]))
+        .collect();
+    let n = segs.len() as u64;
+    if x_pairs <= n {
+        // no more crossings than pairs
+        return Ok(0);
+    }
+    fuel.spend(n * CROSSING_FUEL_PER_SEGMENT)?;
+    // the segments' lengths along each axis over the extent: about how many overlap each
+    let (mut len, mut lo, mut hi) = ([0.0; 2], [f64::MAX; 2], [f64::MIN; 2]);
+    for s in &segs {
+        for k in 0..2 {
+            let (a, b) = if s[0][k] <= s[1][k] { (s[0][k], s[1][k]) } else { (s[1][k], s[0][k]) };
+            len[k] += b - a;
+            lo[k] = if a < lo[k] { a } else { lo[k] };
+            hi[k] = if b > hi[k] { b } else { hi[k] };
+        }
+    }
+    let k = if len[0] * (hi[1] - lo[1]) <= len[1] * (hi[0] - lo[0]) { 0 } else { 1 };
+    for s in &mut segs {
+        if s[0][k] > s[1][k] {
+            s.swap(0, 1);
+        }
+    }
+    segs.sort_unstable_by(|a, b| a[0][k].total_cmp(&b[0][k]));
+    let side = |p: P2, q: P2, r: P2| (q[0] - p[0]) * (r[1] - p[1]) - (q[1] - p[1]) * (r[0] - p[0]);
+    let mut crossings = 0u64;
+    for (i, &[p, q]) in segs.iter().enumerate() {
+        let near = segs[i + 1..].iter().take_while(|t| t[0][k] <= q[k]);
+        let mut pairs = 0u64;
+        for &[r, s] in near {
+            pairs += 1;
+            if side(p, q, r) * side(p, q, s) < 0.0 && side(r, s, p) * side(r, s, q) < 0.0 {
+                crossings += 1;
+            }
+        }
+        fuel.spend(pairs * CROSSING_FUEL_PER_PAIR)?;
+    }
+    Ok(crossings.saturating_sub(n))
 }
 
 /// The x ranges of a set of segments. Below some thousands of segments i_overlay sweeps them
@@ -207,7 +286,7 @@ pub fn clip_with_polygon(ctx: &Ctx) -> Res<Value> {
 fn cut_or_clip(ctx: &Ctx, clip: bool) -> Res<Value> {
     let usage = if clip { CLIP_USAGE } else { CUT_USAGE };
     let spec = ToolSpec { whole_layer: ctx.settings.whole_layer, ..ToolSpec::new(usage, POLY, POLY) };
-    let sel = selection::gather(&spec)?;
+    let mut sel = selection::gather(&spec)?;
     let mut pl = topo::Placer::new(sel.frame()?);
     // every target is registered before the tools are snapped to them
     let targets: Vec<(&LayerInfo, &Feature, Geom)> = sel
@@ -286,7 +365,7 @@ fn cut_or_clip(ctx: &Ctx, clip: bool) -> Res<Value> {
         limit: CUT_WORK_FUEL,
         read_whole: sel.targets_from_active.then_some(sel.active.id),
     };
-    let shared = topo::plan(ctx.settings.topological, &scope, &new_vertices)?;
+    let shared = topo::plan(ctx.settings.topological, &scope, &new_vertices, &mut sel.read)?;
     let tools_deleted = delete_tools(&mut plan, &sel.active, sel.tools.iter(), ctx.settings.keep_tools);
     let (sv, sf, note) = (shared.vertices(), shared.features(), shared.note());
     // before the plan deletes anything: the neighbours' rows are as read
@@ -323,7 +402,9 @@ pub fn cut_results(
 ) -> Res<Vec<(f64, MultiPolygon<f64>)>> {
     let tool_parts = snap_tool_polygons(pl, metric, tool_parts, fuel)?;
     let parts = XRanges::of_polygons(&tool_parts);
-    fuel.spend(parts.fuel() + overlay_fuel(parts.len(), parts.pairs, 0))?;
+    fuel.spend(parts.fuel())?;
+    let crossings = crossings_of(tool_parts.iter(), parts.pairs, fuel)?;
+    fuel.spend(overlay_fuel(parts.len(), parts.pairs, crossings))?;
     let tools = union_of(&tool_parts, solver_for(parts.len(), parts.pairs));
     let tool_bb = tools.bounding_rect();
     let tx = XRanges::of_polygons(&tools.0);
@@ -385,32 +466,48 @@ pub fn add_ring(ctx: &Ctx) -> Res<Value> {
         feature: &'a Feature,
         lonlat: Vec<Polygon<f64>>,
         metric: Vec<Polygon<f64>>,
+        boxes: Vec<Option<Rect<f64>>>,
         rings: usize,
     }
     let mut targets: Vec<Target> = Vec::new();
     for set in &sel.targets {
         for f in &set.features {
             let lonlat = polygons_of(f.geom()?).0;
-            let metric = lonlat.iter().map(|p| frame.project_geo(p)).collect();
-            targets.push(Target { layer: set.layer.id, feature: f, lonlat, metric, rings: 0 });
+            let metric: Vec<Polygon<f64>> = lonlat.iter().map(|p| frame.project_geo(p)).collect();
+            let boxes = metric.iter().map(|p| p.bounding_rect()).collect();
+            targets.push(Target { layer: set.layer.id, feature: f, lonlat, metric, boxes, rings: 0 });
         }
     }
+    let read = budget::edit_fuel(
+        sel.target_count(),
+        budget::vertices(&sel.tools) + sel.targets.iter().map(|t| budget::vertices(&t.features)).sum::<usize>(),
+    );
+    // every tool is tried in every target part its box meets, with up to two boolean ops
+    let mut fuel = Meter::new(
+        CUT_WORK_FUEL.saturating_sub(read),
+        "Trying these polygons as holes in the targets is more than one command can do. Select fewer tool \
+         polygons or targets, or simplify them, and repeat the command for the rest.",
+    );
+    let target_parts: u64 = targets.iter().map(|t| t.metric.len() as u64).sum();
     let (mut added, mut outside, mut crossing) = (0, 0, 0);
     let mut used_tools = Vec::new();
     for t in &sel.tools {
         let mut all_used = true;
         for tool in polygons_of(t.geom()?).0 {
+            fuel.spend(target_parts * SCAN_FUEL_PER_BOX)?;
             let m = frame.project_geo(&tool);
+            let mm = MultiPolygon(vec![m.clone()]);
             let ta = m.unsigned_area();
             let bb = m.bounding_rect();
             let mut placed = false;
             let mut touched = false;
             'targets: for tg in targets.iter_mut() {
-                for (pl, pm) in tg.lonlat.iter_mut().zip(tg.metric.iter_mut()) {
-                    if !matches!((bb, pm.bounding_rect()), (Some(a), Some(b)) if bboxes_intersect(&a, &b)) {
+                for ((pl, pm), pb) in tg.lonlat.iter_mut().zip(tg.metric.iter_mut()).zip(&tg.boxes) {
+                    if !matches!((bb, pb), (Some(a), Some(b)) if bboxes_intersect(&a, b)) {
                         continue;
                     }
-                    let outside_part = m.difference(pm).unsigned_area();
+                    let pmm = MultiPolygon(vec![pm.clone()]);
+                    let outside_part = metered_boolean(&mm, &pmm, OverlayRule::Difference, &mut fuel)?.unsigned_area();
                     if outside_part > ta - AREA_EPS_M2 {
                         continue;
                     }
@@ -423,7 +520,7 @@ pub fn add_ring(ctx: &Ctx) -> Res<Value> {
                     // and the boolean op may then return it as a self-touching shell), but a
                     // stretch along them would shorten the outline, and touches that close off
                     // part of the interior would split it.
-                    let d = drop_slivers(pm.difference(&m));
+                    let d = drop_slivers(metered_boolean(&pmm, &mm, OverlayRule::Difference, &mut fuel)?);
                     let want = perimeter(pm) + perimeter(&m);
                     if d.0.len() != 1 || (perimeter(&d.0[0]) - want).abs() > 1e-3 + 1e-9 * want {
                         continue;
@@ -481,8 +578,8 @@ pub fn add_ring(ctx: &Ctx) -> Res<Value> {
 /// intersecting the selected features of other layers).
 pub fn delete_ring(ctx: &Ctx) -> Res<Value> {
     let spec = EditSpec { whole_layer: ctx.settings.whole_layer, ..EditSpec::new(DELETE_RING_USAGE, POLY) };
-    let ed = selection::active_features(&spec)?;
-    let loc = Locators::read(&ed.layer, &ed.layers, "holes")?;
+    let mut ed = selection::active_features(&spec)?;
+    let loc = Locators::read(&ed.layer, &ed.layers, "holes", &mut ed.read)?;
     let mut plan = Plan::default();
     let mut removed = 0;
     for f in &ed.features {
@@ -516,16 +613,17 @@ pub fn delete_ring(ctx: &Ctx) -> Res<Value> {
 /// Islands lying in a hole (other parts of the feature, other polygons of the layer) stay out
 /// of the new polygon, their own holes not: each hole filled by the command is filled once,
 /// so an island's hole that gets its own fill stays out of the fill around the island, and
-/// one that doesn't belongs to it. When the layer is too large to read, only the selected features are
-/// checked for islands and the message says so: the fill may then overlap other polygons.
+/// one that doesn't belongs to it. When the layer is too large to read on top of the selection
+/// and the locators, only the selected features are checked for islands and the message says
+/// so: the fill may then overlap other polygons.
 pub fn fill_ring(ctx: &Ctx) -> Res<Value> {
     let spec = EditSpec {
         whole_layer: ctx.settings.whole_layer,
         properties: true,
         ..EditSpec::new(FILL_RING_USAGE, POLY)
     };
-    let ed = selection::active_features(&spec)?;
-    let loc = Locators::read(&ed.layer, &ed.layers, "holes")?;
+    let mut ed = selection::active_features(&spec)?;
+    let loc = Locators::read(&ed.layer, &ed.layers, "holes", &mut ed.read)?;
     let parts: Vec<Vec<Polygon<f64>>> = ed.features.iter().map(|f| Ok(polygons_of(f.geom()?).0)).collect::<Res<_>>()?;
     // (feature, part, hole)
     let mut holes = Vec::new();
@@ -537,11 +635,18 @@ pub fn fill_ring(ctx: &Ctx) -> Res<Value> {
     if holes.is_empty() {
         return Err(format!("{FILL_RING_USAGE}. ({})", loc.nothing("holes", ed.features.len())));
     }
-    let boxes: Vec<Rect<f64>> = holes.iter().filter_map(|h| h.2.bounding_rect()).collect();
+    // in one piece: a hole across the antimeridian is not a box round the world
+    let boxes: Vec<Rect<f64>> = holes.iter().filter_map(|h| ring_box(h.2)).collect();
     // A layer too large to read leaves only the selected features to search for islands.
-    let others = layer_islands(&ed, &boxes)?;
+    let others = layer_islands(&mut ed, &boxes)?;
     let layer_checked = others.is_some();
-    let others = others.unwrap_or_else(|| islands_in(&ed.features, &boxes));
+    let (others, layer_read) = others.unwrap_or_else(|| (islands_in(&ed.features, &boxes), 0));
+    let read = budget::edit_fuel(ed.features.len(), budget::vertices(&ed.features)) + layer_read;
+    let mut fuel = Meter::new(
+        CUT_WORK_FUEL.saturating_sub(read),
+        "Filling these holes around the islands in them is more than one command can do. Select fewer \
+         polygons, or simplify them, and repeat the command for the rest.",
+    );
     // holes filled by this command, by (feature id, ring): an island's hole among them is
     // part of the island for the fill around it
     let mut filled: HashMap<(i64, [u64; 2]), Vec<&LineString<f64>>> = HashMap::new();
@@ -555,16 +660,28 @@ pub fn fill_ring(ctx: &Ctx) -> Res<Value> {
     let (mut islands, mut covered) = (0, 0);
     for &(i, k, h) in &holes {
         let ring = ccw(h);
-        let Some(hb) = ring.bounding_rect() else { continue };
+        let Some(hb) = ring_box(&ring) else { continue };
         let id = ed.features[i].id;
         let own = parts[i].iter().enumerate().filter(|(j, _)| *j != k).map(|(_, p)| (id, p));
         let theirs = others.iter().filter(|o| o.0 != id).map(|o| (o.0, &o.1));
         let hole = Polygon::new(ring, vec![]);
-        let hm = frame.project_geo(&hole);
+        let hmm = MultiPolygon(vec![frame.project_geo(&hole)]);
         let mut inside = Vec::new();
-        for (oid, p) in own.chain(theirs).filter(|(_, p)| p.exterior().bounding_rect().is_some_and(|b| within(&b, &hb))) {
+        for (oid, p) in own.chain(theirs) {
+            fuel.spend(SCAN_FUEL_PER_BOX)?;
+            if !ring_box(p.exterior()).is_some_and(|b| in_turns(&b, &hb)) {
+                continue;
+            }
+            // islands outside the selection were read but not projected; the shell is
+            // projected twice
+            let projected = p.exterior().0.len() + geo::CoordsIter::coords_count(p);
+            fuel.spend(projected as u64 * PROJECT_FUEL_PER_VERTEX)?;
             let shell = frame.project_geo(&Polygon::new(p.exterior().clone(), vec![]));
-            if shell.unsigned_area() > AREA_EPS_M2 && shell.difference(&hm).unsigned_area() <= AREA_EPS_M2 {
+            if shell.unsigned_area() > AREA_EPS_M2
+                && metered_boolean(&MultiPolygon(vec![shell.clone()]), &hmm, OverlayRule::Difference, &mut fuel)?
+                    .unsigned_area()
+                    <= AREA_EPS_M2
+            {
                 // every ring, filled holes too: their vertices come back bit-exact
                 snap.add(&Geom::Polygon(p.clone()));
                 let open: Vec<LineString<f64>> = p.interiors().iter().filter(|j| !is_filled(oid, j)).cloned().collect();
@@ -572,16 +689,20 @@ pub fn fill_ring(ctx: &Ctx) -> Res<Value> {
             }
         }
         let g = if inside.is_empty() {
+            fuel.spend(budget::write_fuel(1, hole.exterior().0.len()))?;
             Geom::Polygon(hole)
         } else {
             snap.add(&Geom::Polygon(hole));
-            let free = drop_slivers(MultiPolygon(vec![hm]).difference(&unary_union(inside.iter())));
+            let islands_union = metered_union(&inside, &mut fuel)?;
+            let free = drop_slivers(metered_boolean(&hmm, &islands_union, OverlayRule::Difference, &mut fuel)?);
             if free.0.is_empty() {
                 covered += 1;
                 continue;
             }
             islands += inside.len();
-            snap.unproject(&Geom::MultiPolygon(touching_exactly(free)))
+            let free = touching_exactly(free);
+            fuel.spend(budget::write_fuel(1, geo::CoordsIter::coords_count(&free)))?;
+            snap.unproject(&Geom::MultiPolygon(free))
         };
         plan.add.push((ed.layer.id, prepare_output(g)?, host_io::inherited_attributes(&ed.features[i].properties)));
     }
@@ -685,39 +806,67 @@ fn within(a: &Rect<f64>, b: &Rect<f64>) -> bool {
     a.min().x >= b.min().x - m && a.min().y >= b.min().y - m && a.max().x <= b.max().x + m && a.max().y <= b.max().y + m
 }
 
-/// The active layer's polygons that may be islands in `boxes` (see [`islands_in`]); `None`
-/// when the layer is too large to read within what the command has left.
-fn layer_islands(ed: &selection::Editable, boxes: &[Rect<f64>]) -> Res<Option<Vec<(i64, Polygon<f64>)>>> {
+/// Whether box `a` lies within box `b` (both in one piece, see [`ring_box`]) as it is or a
+/// turn east or west.
+fn in_turns(a: &Rect<f64>, b: &Rect<f64>) -> bool {
+    selection::TURNS.iter().any(|&d| within(&Rect::new(a.min() + (d, 0.0).into(), a.max() + (d, 0.0).into()), b))
+}
+
+/// The lon/lat box of ring `r` taken in one piece across the antimeridian (see
+/// [`selection::in_one_piece`]). The projection takes longitudes the short way round, so
+/// the ring itself is projected as it is.
+fn ring_box(r: &LineString<f64>) -> Option<Rect<f64>> {
+    let bb = r.bounding_rect()?;
+    if bb.width() < 180.0 {
+        return Some(bb);
+    }
+    selection::in_one_piece(&Geom::LineString(r.clone())).map(|(b, _)| b)
+}
+
+/// The active layer's polygons that may be islands in `boxes` (see [`islands_in`]) and the
+/// fuel of reading them beyond the selection; `None` when the layer is too large to read
+/// within what the command has left of its fuel and of its reads (`ed.read`, which the read
+/// is counted against).
+fn layer_islands(ed: &mut selection::Editable, boxes: &[Rect<f64>]) -> Res<Option<(Vec<(i64, Polygon<f64>)>, u64)>> {
     let read;
+    let mut fuel = 0;
     let feats = if ed.features.len() >= ed.layer.features {
         &ed.features
     } else {
         let spent = budget::edit_fuel(ed.features.len(), budget::vertices(&ed.features));
         let fuel_left = (budget::COMMAND_FUEL * 6 / 10).saturating_sub(spent);
         let max_bytes = (fuel_left / budget::READ_FUEL_PER_BYTE).min(budget::MAX_READ_BYTES as u64) as usize;
-        match host_io::all_features_within(&ed.layer, LAYER_READ_CAP, max_bytes)? {
-            Some((v, _)) => {
+        match host_io::all_features_within(&ed.layer, LAYER_READ_CAP, max_bytes, &mut ed.read)? {
+            Some((v, bytes)) => {
                 read = v;
+                fuel = bytes as u64 * budget::READ_FUEL_PER_BYTE;
                 &read
             }
             None => return Ok(None),
         }
     };
-    Ok(Some(islands_in(feats, boxes)))
+    Ok(Some((islands_in(feats, boxes), fuel)))
 }
 
 /// The polygons of `feats` (holes included) whose box lies within one of `boxes`, as
-/// (feature id, polygon).
+/// (feature id, polygon). Boxes are compared in one piece (see [`ring_box`]) and a turn east
+/// and west, so a polygon near 0° is not an island in a hole across the antimeridian.
 fn islands_in(feats: &[Feature], boxes: &[Rect<f64>]) -> Vec<(i64, Polygon<f64>)> {
     let mut out = Vec::new();
     for f in feats {
         let Some(g) = &f.geometry else { continue };
-        if !g.bbox().is_some_and(|b| boxes.iter().any(|h| bboxes_intersect(h, &b))) {
+        let near = selection::in_one_piece(g).is_some_and(|(b, _)| {
+            selection::TURNS.iter().any(|&d| {
+                let b = Rect::new(b.min() + (d, 0.0).into(), b.max() + (d, 0.0).into());
+                boxes.iter().any(|h| bboxes_intersect(h, &b))
+            })
+        });
+        if !near {
             continue;
         }
         for p in polygons_of(g).0 {
-            if let Some(b) = p.bounding_rect()
-                && boxes.iter().any(|h| within(&b, h))
+            if let Some(b) = ring_box(p.exterior())
+                && boxes.iter().any(|h| in_turns(&b, h))
             {
                 out.push((f.id, p));
             }
@@ -750,9 +899,18 @@ pub fn add_part(ctx: &Ctx) -> Res<Value> {
     let merged = if apart {
         parts
     } else {
+        let vertices = budget::vertices(&sel.tools) + budget::vertices(&set.features[..1]);
+        let read = budget::edit_fuel(1, vertices);
+        let mut fuel = Meter::new(
+            CUT_WORK_FUEL.saturating_sub(read),
+            "Merging these polygons with the target's parts is more than one command can do. Select fewer \
+             polygons, or simplify them, and repeat the command for the rest.",
+        );
         let mut snap = VertexSnap::new(sel.frame()?, SNAP_TOL_M);
         let metric = polygons_of(&snap.project(&Geom::MultiPolygon(MultiPolygon(parts))));
-        let u = drop_slivers(unary_union(metric.0.iter()));
+        let u = drop_slivers(metered_union(&metric.0, &mut fuel)?);
+        // the vertices the parts had are written as part of editing the target
+        fuel.spend(budget::write_fuel(0, geo::CoordsIter::coords_count(&u).saturating_sub(vertices)))?;
         polygons_of(&snap.unproject(&Geom::MultiPolygon(u))).0
     };
     let after = merged.len();
@@ -786,8 +944,8 @@ pub fn split_off_part(ctx: &Ctx) -> Res<Value> {
 
 fn parts_command(ctx: &Ctx, split: bool) -> Res<Value> {
     let usage = if split { SPLIT_PART_USAGE } else { DELETE_PART_USAGE };
-    let ed = selection::active_features(&EditSpec { properties: split, ..EditSpec::new(usage, POLY) })?;
-    let loc = Locators::read(&ed.layer, &ed.layers, "parts")?;
+    let mut ed = selection::active_features(&EditSpec { properties: split, ..EditSpec::new(usage, POLY) })?;
+    let loc = Locators::read(&ed.layer, &ed.layers, "parts", &mut ed.read)?;
     let mut plan = Plan::default();
     let (mut moved, mut all_hit) = (0, 0);
     for f in &ed.features {
@@ -795,10 +953,8 @@ fn parts_command(ctx: &Ctx, split: bool) -> Res<Value> {
         if parts.len() < 2 {
             continue;
         }
-        // comparing parts of one feature: lon/lat areas rank them like metric ones
-        let largest = (0..parts.len())
-            .max_by(|&a, &b| parts[a].unsigned_area().total_cmp(&parts[b].unsigned_area()))
-            .unwrap_or(0);
+        let areas = part_areas(f.geom()?, &parts);
+        let largest = (0..parts.len()).max_by(|&a, &b| areas[a].total_cmp(&areas[b])).unwrap_or(0);
         let mut picked: Vec<bool> =
             parts.iter().enumerate().map(|(i, p)| if loc.is_empty() { i != largest } else { loc.picks(p) }).collect();
         if picked.iter().all(|&b| b) {
@@ -852,6 +1008,12 @@ fn parts_command(ctx: &Ctx, split: bool) -> Res<Value> {
 pub fn fill_gap(ctx: &Ctx) -> Res<Value> {
     let spec = EditSpec { whole_layer: ctx.settings.whole_layer, ..EditSpec::new(FILL_GAP_USAGE, POLY) };
     let ed = selection::active_features(&spec)?;
+    let read = budget::edit_fuel(ed.features.len(), budget::vertices(&ed.features));
+    let mut fuel = Meter::new(
+        CUT_WORK_FUEL.saturating_sub(read),
+        "Finding the gaps between these polygons is more than one command can do. Select fewer polygons, or \
+         simplify them, and repeat the command for the rest.",
+    );
     let mut snap = VertexSnap::new(ed.frame()?, SNAP_TOL_M);
     let mut polys = Vec::new();
     for f in &ed.features {
@@ -865,22 +1027,37 @@ pub fn fill_gap(ctx: &Ctx) -> Res<Value> {
         .collect();
     let mut small = 0;
     let mut plan = Plan::default();
-    for gap in gaps(&polys) {
+    for gap in gaps(&polys, &mut fuel)? {
         let a = gap.unsigned_area();
+        if a < MIN_GAP_M2 {
+            small += 1;
+            continue;
+        }
         // an opening (shrink, then grow back) removes the parts narrower than the width
-        if a < MIN_GAP_M2
-            || gap.buffer(-0.5 * MIN_GAP_WIDTH_M).buffer(0.5 * MIN_GAP_WIDTH_M).unsigned_area() < MIN_GAP_M2
-        {
+        fuel.spend(2 * buffer_fuel(&gap, 0.5 * MIN_GAP_WIDTH_M))?;
+        if gap.buffer(-0.5 * MIN_GAP_WIDTH_M).buffer(0.5 * MIN_GAP_WIDTH_M).unsigned_area() < MIN_GAP_M2 {
             small += 1;
             continue;
         }
         let Some(bb) = gap.bounding_rect() else { continue };
-        let is_own_hole = own_holes.iter().any(|(hb, h)| {
-            bboxes_intersect(hb, &bb)
+        let gm = MultiPolygon(vec![gap.clone()]);
+        let mut is_own_hole = false;
+        for (hb, h) in &own_holes {
+            fuel.spend(SCAN_FUEL_PER_BOX)?;
+            if bboxes_intersect(hb, &bb)
                 && (h.unsigned_area() - a).abs() < AREA_EPS_M2
-                && (gap.intersection(h).unsigned_area() - a).abs() < AREA_EPS_M2
-        });
+                && (metered_boolean(&gm, &MultiPolygon(vec![h.clone()]), OverlayRule::Intersect, &mut fuel)?
+                    .unsigned_area()
+                    - a)
+                    .abs()
+                    < AREA_EPS_M2
+            {
+                is_own_hole = true;
+                break;
+            }
+        }
         if !is_own_hole {
+            fuel.spend(budget::write_fuel(1, geo::CoordsIter::coords_count(&gap)))?;
             let g = prepare_output(snap.unproject(&Geom::Polygon(gap)))?;
             plan.add.push((ed.layer.id, g, Map::new()));
         }
@@ -913,6 +1090,38 @@ fn perimeter(p: &Polygon<f64>) -> f64 {
 
 pub(crate) fn polygons_of(g: &Geom) -> MultiPolygon<f64> {
     g.to_multi_polygon().unwrap_or_else(|| MultiPolygon(vec![]))
+}
+
+/// The areas of `parts`, the parts of `g`, to rank them, in m²: through the frame of `g`
+/// (lon/lat areas are off by the latitude, and a part across the antimeridian would span
+/// 360°), else, when no frame fits the whole feature, through each part's own frame. A part
+/// no frame fits (too wide, or near a pole) is measured in one piece on the cylindrical
+/// equal-area projection of the authalic sphere, its edges taken as straight in lon/lat:
+/// within about 1 % of its area on the ellipsoid, enough to rank parts.
+fn part_areas(g: &Geom, parts: &[Polygon<f64>]) -> Vec<f64> {
+    if let Ok(frame) = Frame::for_geoms([g]) {
+        return parts.iter().map(|p| frame.project_geo(p).unsigned_area()).collect();
+    }
+    // the radius of the sphere with the area of the GRS80 ellipsoid
+    const R_AUTHALIC_M: f64 = 6_371_007.2;
+    parts
+        .iter()
+        .map(|p| {
+            let part = Geom::Polygon(p.clone());
+            if let Ok(frame) = Frame::for_geoms([&part]) {
+                return frame.project_geo(p).unsigned_area();
+            }
+            let lonlat = match selection::in_one_piece(&part) {
+                Some((_, Some(one))) => one,
+                _ => part.to_geo(),
+            };
+            geo::MapCoords::map_coords(&lonlat, |c| geo::Coord {
+                x: R_AUTHALIC_M * c.x.to_radians(),
+                y: R_AUTHALIC_M * c.y.to_radians().sin(),
+            })
+            .unsigned_area()
+        })
+        .collect()
 }
 
 fn drop_slivers(mut mp: MultiPolygon<f64>) -> MultiPolygon<f64> {
@@ -958,26 +1167,30 @@ fn delete_tools<'a>(
 }
 
 /// Gaps = holes of the union of the set, minus polygons lying inside those holes (islands).
-/// Gaps open to the outside (a bay between three parcels) are not found, as in QGIS.
-pub fn gaps(polys: &[Polygon<f64>]) -> Vec<Polygon<f64>> {
-    let u = unary_union(polys.iter());
+/// Gaps open to the outside (a bay between three parcels) are not found, as in QGIS. Charges
+/// `fuel` for the boolean ops.
+pub fn gaps(polys: &[Polygon<f64>], fuel: &mut Meter) -> Res<Vec<Polygon<f64>>> {
+    let u = metered_union(polys, fuel)?;
     let holes = MultiPolygon(
         u.0.iter().flat_map(|p| p.interiors().iter().map(|r| Polygon::new(r.clone(), vec![]))).collect(),
     );
     if holes.0.is_empty() {
-        return vec![];
+        return Ok(vec![]);
     }
-    holes.difference(&u).0
+    Ok(metered_boolean(&holes, &u, OverlayRule::Difference, fuel)?.0)
 }
 
 /// The selected features of the other vector layers, which pick the holes or parts a
-/// command acts on. Empty: act on all of them.
+/// command acts on. Empty: act on all of them. Each is kept in one piece across the
+/// antimeridian (see [`selection::in_one_piece`]) with the box of that piece.
 struct Locators(Vec<(Rect<f64>, geo::Geometry<f64>)>);
 
 impl Locators {
     /// Refuses a selection made only of features without a usable geometry: read as "no
     /// locators", it would act on every hole or part instead of the ones meant.
-    fn read(active: &LayerInfo, layers: &[LayerInfo], what: &str) -> Res<Locators> {
+    /// The locator layers are read within what is left of `read`, the command's reads so far,
+    /// and counted against it.
+    fn read(active: &LayerInfo, layers: &[LayerInfo], what: &str, read: &mut budget::ReadAllowance) -> Res<Locators> {
         let mut v = Vec::new();
         let mut unusable = Vec::new();
         for l in layers.iter().filter(|l| l.id != active.id && l.is_vector() && l.selected > 0) {
@@ -985,11 +1198,13 @@ impl Locators {
                 return Err(format!("{} features are selected in '{}'; select fewer locators", l.selected, l.name));
             }
             let before = v.len();
-            for f in host_io::selected_features(l.id, false)? {
+            let q = host_io::Query { selected: true, limit: None, properties: false };
+            let named = format!("the {} selected features of '{}'", l.selected, l.name);
+            for f in host_io::features_within(l.id, q, &named, read)? {
                 if let Some(g) = &f.geometry
-                    && let Some(bb) = g.bbox()
+                    && let Some((bb, one)) = selection::in_one_piece(g)
                 {
-                    v.push((bb, g.to_geo()));
+                    v.push((bb, one.unwrap_or_else(|| g.to_geo())));
                 }
             }
             if v.len() == before {
@@ -1011,13 +1226,22 @@ impl Locators {
     }
 
     /// Whether `p` is picked: always without locators, else when a locator intersects it.
+    /// Both are taken in one piece and compared also a turn east and west, so a locator at
+    /// 179.95°W picks a part from 179.9°E to 179.9°W and one near 0° does not.
     fn picks(&self, p: &Polygon<f64>) -> bool {
+        use geo::Translate;
         if self.is_empty() {
             return true;
         }
-        let Some(bb) = p.bounding_rect() else { return false };
-        let g = geo::Geometry::Polygon(p.clone());
-        self.0.iter().any(|(lb, lg)| bboxes_intersect(lb, &bb) && lg.intersects(&g))
+        let Some((bb, one)) = selection::in_one_piece(&Geom::Polygon(p.clone())) else { return false };
+        let g = one.unwrap_or_else(|| geo::Geometry::Polygon(p.clone()));
+        self.0.iter().any(|(lb, lg)| {
+            selection::TURNS.iter().any(|&d| {
+                let shifted = Rect::new(bb.min() + (d, 0.0).into(), bb.max() + (d, 0.0).into());
+                bboxes_intersect(lb, &shifted)
+                    && if d == 0.0 { lg.intersects(&g) } else { lg.intersects(&g.translate(d, 0.0)) }
+            })
+        })
     }
 
     /// Whether the area inside ring `r` (a hole) is picked.

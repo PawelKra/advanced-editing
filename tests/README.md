@@ -82,8 +82,12 @@ budget ("it ran too long"); host calls are free, tools get 60 times more. `host_
 refuses work that would not fit before it starts, with a message that says what to do:
 
 - Every `host.features` reply over `MAX_READ_BYTES` (1.2 MB, 30 % of the budget) is refused
-  before parsing: "Reading the 35 features of 'blobs' means 1.4 MB of data; one command reads
-  about 1.2 MB. Select fewer features." (`host_io::features*`, `all_features_capped`).
+  by its length, before it is copied into the module or parsed: "Reading the 35 features of
+  'blobs' means 1.4 MB of data; one command reads about 1.2 MB. Select fewer features."
+  (`host_io::features*`, `all_features_capped`). `selection::gather`, `active_features` and
+  the locators of the ring and part commands read all their layers within one
+  `budget::ReadAllowance`, so the layer that would take the command over 1.2 MB is refused
+  the same way ("… means 0.5 MB of data on top of the 0.9 MB already read; …").
 - `selection::gather` and `selection::active_features` refuse selections whose reading,
   projecting and writing would take more than half the budget, about 20 000 vertices: "This
   would edit 812 features with 61 000 vertices; one command handles about 20 000 vertices.
@@ -100,6 +104,9 @@ refuses work that would not fit before it starts, with a message that says what 
   boolean ops and slices (`polygons::overlay_fuel` from `polygons::XRanges`), placing and
   sharing the new vertices and the writes, all before the first write, and give topological
   editing what is left (`topo::Scope::limit`).
+  Add Ring, Fill Ring, Add Part, Fill Gap and polygon Merge charge a `budget::Meter` for each
+  boolean op and union the same way (`polygons::metered_boolean`, `polygons::metered_union`),
+  counting the crossings of the edges first, beyond one per edge (`polygons::crossings_of`).
 
 `test_limits.py`, `test_division.py`, `test_lines.py` and `test_attributes.py` check the
 guards on both sides of the limit. To measure a cost, the diagnostic build has `diag-bench`
@@ -114,8 +121,11 @@ the op (`"base"`) gives what one run of it takes, to about 0.01 % of the budget.
 
 `pkg-diag/plugin.wasm` is built with `--features diagnostics` (`src/diagnostics.rs`); the
 harness declares these commands in the test copy of `plugin.json`. They never ship:
-`diag-layers`, `diag-features` (`rewrite` writes every geometry back unchanged),
+`diag-layers`, `diag-features` (`rewrite` writes every geometry back unchanged, `readLeft`
+reads with only that many bytes of the command's reads left and reports the memory grown),
 `diag-selection`, `diag-proj` (`grid` compares with the term-by-term reference projection),
 `diag-geojson` (`numbers` checks number text against serde_json), `diag-snap`, `diag-delete`
 (`select` then sets the selection), `diag-add`, `diag-settings` (every panel setting),
-`diag-bench`.
+`diag-bench`, `diag-divide-parcel` (the Divide Parcel tool run within the command on the
+`features` given, with the tool's `params`: its error, output features, and how many parcels
+it started preparing).

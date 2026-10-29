@@ -166,6 +166,20 @@ def test_merge_sums_numbers():
         check(f['n'] == 1 and f['w'] is None, f)
 
 
+def test_merge_sum_out_of_range_is_refused():
+    # 1e308 + 1e308 is beyond a double; JSON has no infinity, so it would be stored as null
+    lon, lat = PL
+    data = write_layer('huge', [feature(polygon(rect(lon, lat, 100, 100, x0, 0)), name=n, n=i, w=1e308)
+                                for x0, n, i in [(0, 'a', 1), (100, 'b', 2)]])
+    with Session(data) as s:
+        before = snapshot(s, 'huge')
+        s.activate('huge')
+        s.select('huge', [0, 1])
+        e = s.error_of('merge-with-attributes', {'sum': True})
+        check('"w"' in e and 'out of range' in e, e)
+        check(unchanged(before, snapshot(s, 'huge')), 'data changed')
+
+
 def test_merge_needs_two_features():
     with Session(parcels()) as s:
         before = snapshot(s, 'parcels')
@@ -320,6 +334,39 @@ def test_simplify_leaves_a_feature_that_would_turn_invalid():
         r = s.plugin('simplify', {'tolerance': 0.5})
         check(r['changed'] == 0 and r['invalid'] == 1 and 'invalid' in r['message'], r)
         check(same_geom(s.features('dent')[0]['geometry'], before[0]['geometry']), 'the feature changed')
+
+
+def test_simplify_leaves_an_invalid_feature_that_stays_invalid():
+    # A bow-tie shell with redundant vertices on its sides: dropping them changes the feature
+    # but leaves it self-crossing, so nothing is written.
+    lon, lat = PL
+    shell = [offset_m(lon, lat, x, y)
+             for x, y in [(0, 0), (25, 25), (100, 100), (100, 50), (100, 0), (0, 100), (0, 50), (0, 0)]]
+    with Session(write_layer('bowtie', [feature(polygon(shell), name='b', n=1, w=1.0)])) as s:
+        before = s.features('bowtie')
+        s.activate('bowtie')
+        s.select('bowtie', [0])
+        r = s.plugin('simplify', {'tolerance': 0.5})
+        check(r['changed'] == 0 and r['alreadyInvalid'] == 1 and 'already invalid' in r['message'], r)
+        check(same_geom(s.features('bowtie')[0]['geometry'], before[0]['geometry']), 'the feature changed')
+
+
+def test_simplify_does_not_write_a_self_touching_ring():
+    # Two lobes pinched to one point, which the ring passes twice: a ring touching itself is
+    # not simple, so the simplified ring (still touching there) is not written either.
+    lon, lat = PL
+    shell = [offset_m(lon, lat, x, y)
+             for x, y in [(0, 0), (50, 0.1), (100, 0), (50, 50), (100, 100), (50, 100.1), (0, 100), (50, 50), (0, 0)]]
+    with Session(write_layer('neck', [feature(polygon(shell), name='n', n=1, w=1.0)])) as s:
+        before = s.features('neck')
+        s.activate('neck')
+        s.select('neck', [0])
+        r = s.plugin('simplify', {'tolerance': 0.5})
+        check(r['changed'] == 0 and r['alreadyInvalid'] == 1 and 'already invalid' in r['message'], r)
+        check(same_geom(s.features('neck')[0]['geometry'], before[0]['geometry']), 'the feature changed')
+        # smoothing cuts the pinch apart into a valid ring, which is written
+        r = s.plugin('smooth', {'iterations': 1})
+        check(r['changed'] == 1 and r['alreadyInvalid'] == 0, r)
 
 
 def test_simplify_refuses_points():

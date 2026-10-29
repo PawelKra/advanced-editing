@@ -23,7 +23,7 @@ CLI = os.environ.get('RUSTGIS_CLI', 'rustgis-cli')
 
 # Commands compiled in with `--features diagnostics` (src/diagnostics.rs).
 DIAG_COMMANDS = ['diag-proj', 'diag-geojson', 'diag-snap', 'diag-features', 'diag-selection',
-                 'diag-delete', 'diag-add', 'diag-settings', 'diag-layers', 'diag-bench']
+                 'diag-delete', 'diag-add', 'diag-settings', 'diag-layers', 'diag-bench', 'diag-divide-parcel']
 
 
 class CommandError(Exception):

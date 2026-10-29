@@ -69,21 +69,50 @@ fn divide_fuel(v: usize, p: usize, pieces: f64) -> u64 {
 /// above 57°, where the projection's cosine needs libm.
 const AUTHALIC_PIECE_FUEL: f64 = 14_000.0;
 
-/// A parcel to check: its vertices, parts and the further pieces its edges are measured in.
+/// Fuel per crossing of a cut with the parcel's edges beyond two per cut: solving for the
+/// cuts across it, slicing, placing the vertex it makes on the edge in the parts on both
+/// sides and measuring them. `diag-bench` runs on combs of 40 to 2400 vertices cut across
+/// their teeth into 2 to 50 parts measure 130 000 to 260 000.
+const CROSSING_FUEL: u64 = 350_000;
+
+/// A parcel to check: its vertices, parts, the further pieces its edges are measured in and
+/// the further crossings of its edges with the cuts ([`Parcel::extra_crossings`]; 0 before
+/// the cuts are placed).
 struct Load {
     vertices: usize,
     parts: usize,
     pieces: f64,
+    extra: usize,
+}
+
+/// Fuel to read and divide `parcels`, without writing the parts.
+fn division_fuel(parcels: &[Load]) -> u64 {
+    let vertices: usize = parcels.iter().map(|l| l.vertices).sum();
+    let compute: u64 =
+        parcels.iter().map(|l| divide_fuel(l.vertices, l.parts, l.pieces) + l.extra as u64 * CROSSING_FUEL).sum();
+    budget::edit_fuel(parcels.len(), vertices) + compute
 }
 
 /// Refuses dividing `parcels` when reading them, dividing them and writing the parts would
-/// not fit in `fuel`. Each cut adds about two vertices to each side.
+/// not fit in `fuel`. Each cut adds about two vertices to each side; every further crossing
+/// of a cut with an edge adds a vertex to each side, to be shared with the neighbours too.
 fn check_division(parcels: &[Load], fuel: u64, too_much: impl Fn(usize, usize, usize) -> String) -> Res<()> {
     let vertices: usize = parcels.iter().map(|l| l.vertices).sum();
     let parts: usize = parcels.iter().map(|l| l.parts).sum();
-    let compute: u64 = parcels.iter().map(|l| divide_fuel(l.vertices, l.parts, l.pieces)).sum();
-    let need = budget::edit_fuel(parcels.len(), vertices) + compute + budget::edit_fuel(parts, vertices + 4 * parts);
+    let extra = parcels.iter().fold(0usize, |s, l| s.saturating_add(l.extra)).saturating_mul(2);
+    let need = division_fuel(parcels)
+        + budget::edit_fuel(parts, (vertices + 4 * parts).saturating_add(extra))
+        + topo::share_fuel(extra, extra);
     if need <= fuel { Ok(()) } else { Err(too_much(parcels.len(), vertices, parts)) }
+}
+
+/// The positions of a GeoJSON geometry, counted without decoding it.
+fn positions(g: &Value) -> usize {
+    match g.as_array() {
+        Some(a) if a.first().is_some_and(Value::is_number) => 1,
+        Some(a) => a.iter().map(positions).sum(),
+        None => g.get("coordinates").map_or(0, positions),
+    }
 }
 
 /// How areas are measured.
@@ -749,6 +778,24 @@ impl Parcel {
         (perimeter + 2.0 * parts.saturating_sub(1) as f64 * (hi - lo)) / AUTHALIC_PIECE_M
     }
 
+    /// How many more times the cut lines {n·p = t} for `cuts` cross the parcel's edges than
+    /// twice each, as across a convex parcel: a comb or a serpentine lying across the cuts is
+    /// crossed by each of them many times.
+    fn extra_crossings(&self, n: P2, cuts: &[f64]) -> usize {
+        let mut sorted = cuts.to_vec();
+        sorted.sort_by(f64::total_cmp);
+        let mut crossings = 0usize;
+        for (r, _) in &self.rings {
+            for (i, a) in r.iter().enumerate() {
+                let b = r[(i + 1) % r.len()];
+                let (ta, tb) = (n[0] * a.x + n[1] * a.y, n[0] * b.x + n[1] * b.y);
+                let (lo, hi) = (ta.min(tb), ta.max(tb));
+                crossings += sorted.partition_point(|&c| c < hi) - sorted.partition_point(|&c| c <= lo);
+            }
+        }
+        crossings.saturating_sub(2 * cuts.len())
+    }
+
     fn centroid(&self) -> Coord<f64> {
         let mut m = Moments::default();
         for (r, w) in &self.rings {
@@ -779,6 +826,11 @@ impl Parcel {
     /// its centroid lies in.
     pub fn divide(&self, n: P2, plan: Plan) -> Res<Vec<Part>> {
         let (cuts, aims) = self.cuts(n, plan)?;
+        self.divide_at(n, plan, cuts, aims)
+    }
+
+    /// [`Parcel::divide`] at the cut positions and with the targets [`Parcel::cuts`] found.
+    fn divide_at(&self, n: P2, plan: Plan, cuts: Vec<f64>, aims: Vec<Option<f64>>) -> Res<Vec<Part>> {
         let shapes: Vec<Vec<Vec<P2>>> = self.local.0.iter().map(geojson::contours).collect();
         let lines = self.cut_lines(n, &cuts);
         let slices = shapes.slice_by(&lines, FillRule::EvenOdd);
@@ -855,7 +907,7 @@ fn areas_text(parts: &[Part]) -> String {
 /// attributes.
 fn divide_selected(ctx: &Ctx, plan: Plan, keep_last: bool) -> Res<(Vec<(i64, Vec<Part>)>, Value)> {
     let spec = EditSpec { properties: true, ..EditSpec::new(USAGE, &[Dim::Polygon]) };
-    let ed = active_features(&spec)?;
+    let mut ed = active_features(&spec)?;
     let parts = match plan {
         Plan::Equal(k) => k,
         _ => 2,
@@ -869,7 +921,8 @@ fn divide_selected(ctx: &Ctx, plan: Plan, keep_last: bool) -> Res<(Vec<(i64, Vec
     };
     let vertices = |f: &host_io::Feature| f.geometry.as_ref().map_or(0, Geom::num_coords);
     // by the vertices first, so that preparing the parcels fits; then with their edges' lengths
-    let loads: Vec<Load> = ed.features.iter().map(|f| Load { vertices: vertices(f), parts, pieces: 0.0 }).collect();
+    let loads: Vec<Load> =
+        ed.features.iter().map(|f| Load { vertices: vertices(f), parts, pieces: 0.0, extra: 0 }).collect();
     check_division(&loads, budget::COMMAND_FUEL, too_much)?;
     let n = sweep_normal(ctx.settings.angle_deg, ctx.settings.reverse);
     let mut parcels = Vec::with_capacity(ed.features.len());
@@ -877,17 +930,29 @@ fn divide_selected(ctx: &Ctx, plan: Plan, keep_last: bool) -> Res<(Vec<(i64, Vec
         let fail = |e: String| format!("{USAGE}. (feature {}: {e})", f.id);
         parcels.push(Parcel::new(f.geom()?, AreaMode::Ellipsoidal).map_err(fail)?);
     }
+    // where the cuts go: how often they cross the edges is known before cutting
+    let mut planned = Vec::with_capacity(parcels.len());
+    for (f, parcel) in ed.features.iter().zip(&parcels) {
+        let fail = |e: String| format!("{USAGE}. (feature {}: {e})", f.id);
+        planned.push(parcel.cuts(n, plan).map_err(fail)?);
+    }
     let loads: Vec<Load> = ed
         .features
         .iter()
         .zip(&parcels)
-        .map(|(f, p)| Load { vertices: vertices(f), parts, pieces: p.authalic_pieces(n, parts) })
+        .zip(&planned)
+        .map(|((f, p), (cuts, _))| Load {
+            vertices: vertices(f),
+            parts,
+            pieces: p.authalic_pieces(n, parts),
+            extra: p.extra_crossings(n, cuts),
+        })
         .collect();
     check_division(&loads, budget::COMMAND_FUEL, too_much)?;
     let mut done = Vec::with_capacity(ed.features.len());
-    for (f, parcel) in ed.features.iter().zip(&parcels) {
+    for ((f, parcel), (cuts, aims)) in ed.features.iter().zip(&parcels).zip(planned) {
         let fail = |e: String| format!("{USAGE}. (feature {}: {e})", f.id);
-        let parts = parcel.divide(n, plan).map_err(fail)?;
+        let parts = parcel.divide_at(n, plan, cuts, aims).map_err(fail)?;
         if parts.len() < 2 {
             return Err(fail("the cut misses it".into()));
         }
@@ -900,18 +965,35 @@ fn divide_selected(ctx: &Ctx, plan: Plan, keep_last: bool) -> Res<(Vec<(i64, Vec
         .enumerate()
         .flat_map(|(i, (_, ps))| ps.iter().flat_map(move |p| p.new_vertices.iter().map(move |v| NewVertex { owner: i, ..*v })))
         .collect();
-    let results = done.iter_mut().enumerate().flat_map(|(i, (_, ps))| ps.iter_mut().map(move |p| (i, &mut p.geom)));
-    // the division was checked as a whole beforehand
-    topo::share_within(ed.frame()?, results, &new_vertices, &mut budget::Meter::unlimited())?;
+    // The parts as cut: the vertices they have beyond the parcels' are written, and the new
+    // ones shared between parcels, within what reading and cutting left of the budget. The
+    // parts of one parcel come from one slice and have each other's vertices already.
+    let read = budget::vertices(&ed.features);
+    let count: usize = done.iter().map(|(_, ps)| ps.len()).sum();
+    let coords: usize = done.iter().flat_map(|(_, ps)| ps.iter().map(|p| p.geom.num_coords())).sum();
+    let mut spent = division_fuel(&loads) + budget::write_fuel(count, coords.saturating_sub(read));
+    let left = budget::COMMAND_FUEL.saturating_sub(spent);
+    let share = done.len() > 1;
+    if left == 0 || (share && topo::share_fuel(new_vertices.len(), coords) > left) {
+        return Err(too_much(ed.features.len(), read, parts));
+    }
+    if share {
+        let results = done.iter_mut().enumerate().flat_map(|(i, (_, ps))| ps.iter_mut().map(move |p| (i, &mut p.geom)));
+        let mut fuel = budget::Meter::new(left, too_much(ed.features.len(), read, parts));
+        topo::share_within(ed.frame()?, results, &new_vertices, &mut fuel)?;
+        spent += fuel.spent;
+    }
     let scope = topo::Scope {
         layers: &ed.layers,
         edited: vec![layer],
         exclude: done.iter().map(|(f, _)| (layer, f.id)).collect(),
-        spent: budget::edit_fuel(ed.features.len(), budget::vertices(&ed.features)),
-        limit: topo::EDIT_FUEL_LIMIT,
+        // the parcels were read and divided, and the parts' writes and sharing charged: the
+        // neighbours get what is left of the command, with the margin Cut keeps
+        spent,
+        limit: crate::polygons::CUT_WORK_FUEL,
         read_whole: None,
     };
-    let shared = topo::plan(ctx.settings.topological, &scope, &new_vertices)?;
+    let shared = topo::plan(ctx.settings.topological, &scope, &new_vertices, &mut ed.read)?;
     let mut rows = Vec::new();
     let mut created = 0usize;
     for (f, parts) in &done {
@@ -1026,6 +1108,49 @@ fn tool_plan(req: &Request) -> Res<Plan> {
     }
 }
 
+/// Most lines about single parcels in the tool's answer: the parcels divided beyond them are
+/// in the summary, the skipped ones counted in one more line.
+const MAX_PARCEL_MESSAGES: usize = 150;
+
+/// The largest layer the tool returns, by its estimated GeoJSON text: the parts are built as
+/// JSON values (somewhat larger than their text) and then serialized, with the input and the
+/// prepared parcels still held, all within the module's 512 MB.
+pub const MAX_TOOL_OUTPUT_BYTES: usize = 64_000_000;
+
+/// GeoJSON text of a part besides its coordinates and its parcel's attributes: the feature's
+/// frame, `src_id`, `part` and `area_m2`.
+const PART_FRAME_BYTES: usize = 150;
+
+/// Estimated GeoJSON text of a parcel of `v` vertices, whose attributes take `props` bytes,
+/// cut into `p` parts: every part has the attributes and about four vertices of the cuts
+/// besides its share of the parcel's.
+fn output_bytes(v: usize, p: usize, props: usize) -> usize {
+    let per_vertex = budget::BYTES_PER_VERTEX as usize;
+    p.saturating_mul(props + PART_FRAME_BYTES + 4 * per_vertex).saturating_add(v.saturating_mul(per_vertex))
+}
+
+/// The length of `v` as JSON text, counted without writing it.
+fn json_len(v: &Value) -> usize {
+    struct Count(usize);
+    impl std::io::Write for Count {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0 += b.len();
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut c = Count(0);
+    let _ = rustgis_plugin::serde_json::to_writer(&mut c, v);
+    c.0
+}
+
+/// Parcels the tool has started preparing since the counter was reset (diagnostic build):
+/// shows which checks come before any preparation.
+#[cfg(feature = "diagnostics")]
+pub static PREPARED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// The `divide-parcel` geoprocessing tool: returns the division proposal as a new layer.
 /// Tools make no host requests; the input layer's features are in `req.layers` (only the
 /// selected ones when the layer has a selection) and come as lon/lat GeoJSON.
@@ -1044,43 +1169,105 @@ pub fn divide_parcel_tool(req: &Request) -> Res<Value> {
         _ => AreaMode::Ellipsoidal,
     };
     let n = sweep_normal(angle, req.bool("reverse").unwrap_or(false));
-    let prepared: Vec<Res<(Parcel, usize)>> = feats
-        .iter()
-        .map(|f| {
-            let g = f.get("geometry").filter(|g| !g.is_null()).ok_or_else(|| "no geometry".to_string())?;
-            let g = geojson::from_geojson(g)?;
-            Ok((Parcel::new(&g, mode)?, g.num_coords()))
-        })
-        .collect();
-    let parcels: Vec<Load> = prepared
-        .iter()
-        .flatten()
-        .map(|(p, v)| {
-            let parts = p.parts_estimate(n, plan);
-            Load { vertices: *v, parts, pieces: p.authalic_pieces(n, parts) }
-        })
-        .collect();
-    check_division(&parcels, budget::TOOL_FUEL, |count, v, parts| {
+    let too_much = |count: usize, v: usize, parts: usize| {
         format!(
             "Dividing {count} polygon(s) with {} vertices into about {} parts is more than one run of the tool can do. \
              Select fewer polygons or ask for fewer parts.",
             budget::count(v),
             budget::count(parts)
         )
-    })?;
+    };
+    // Every part carries its parcel's attributes: the layer is checked by its size too.
+    let too_big = |count: usize, parts: usize, bytes: usize| -> Res<()> {
+        if bytes <= MAX_TOOL_OUTPUT_BYTES {
+            return Ok(());
+        }
+        Err(format!(
+            "Dividing {count} polygon(s) into about {} parts would make a layer of about {} MB, every part with \
+             its parcel's attributes; one run of the tool makes at most {} MB. Select fewer polygons, ask for \
+             fewer parts, or leave large attributes out of the input.",
+            budget::count(parts),
+            budget::count(bytes.div_ceil(1_000_000)),
+            MAX_TOOL_OUTPUT_BYTES / 1_000_000
+        ))
+    };
+    // Before decoding anything: every feature's vertices, cut into the fewest parts the plan
+    // may give.
+    let fewest = match plan {
+        Plan::Equal(k) => k,
+        _ => 2,
+    };
+    let sizes: Vec<usize> = feats.iter().map(|f| f.get("geometry").map_or(0, positions)).collect();
+    let props: Vec<usize> = feats.iter().map(|f| f.get("properties").map_or(0, json_len)).collect();
+    let loads: Vec<Load> = sizes.iter().map(|&v| Load { vertices: v, parts: fewest, pieces: 0.0, extra: 0 }).collect();
+    check_division(&loads, budget::TOOL_FUEL, too_much)?;
+    let bytes = sizes.iter().zip(&props).map(|(&v, &b)| output_bytes(v, fewest, b)).fold(0, usize::saturating_add);
+    too_big(feats.len(), feats.len().saturating_mul(fewest), bytes)?;
+    // A feature that cannot be divided still took reading and preparing: the part of
+    // `divide_fuel` that grows with its vertices alone.
+    let mut failed = 0u64;
+    let prepared: Vec<Res<(Parcel, usize)>> = feats
+        .iter()
+        .zip(&sizes)
+        .map(|(f, &v)| {
+            #[cfg(feature = "diagnostics")]
+            PREPARED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let prep = || {
+                let g = f.get("geometry").filter(|g| !g.is_null()).ok_or_else(|| "no geometry".to_string())?;
+                let g = geojson::from_geojson(g)?;
+                Ok((Parcel::new(&g, mode)?, g.num_coords()))
+            };
+            let r = prep();
+            if r.is_err() {
+                failed += budget::edit_fuel(1, v) + divide_fuel(v, 0, 0.0);
+            }
+            r
+        })
+        .collect();
+    let mut bytes = 0usize;
+    let mut parcels: Vec<Load> = prepared
+        .iter()
+        .zip(&props)
+        .filter_map(|(r, &b)| r.as_ref().ok().map(|(p, v)| (p, *v, b)))
+        .map(|(p, v, b)| {
+            let parts = p.parts_estimate(n, plan);
+            bytes = bytes.saturating_add(output_bytes(v, parts, b));
+            Load { vertices: v, parts, pieces: p.authalic_pieces(n, parts), extra: 0 }
+        })
+        .collect();
+    check_division(&parcels, budget::TOOL_FUEL.saturating_sub(failed), too_much)?;
+    too_big(parcels.len(), parcels.iter().map(|l| l.parts).fold(0, usize::saturating_add), bytes)?;
+    // where the cuts go: how often they cross the edges is known before cutting
+    let mut loads = parcels.iter_mut();
+    let planned: Vec<Res<(Parcel, Vec<f64>, Vec<Option<f64>>)>> = prepared
+        .into_iter()
+        .map(|prep| {
+            let (p, _) = prep?;
+            let load = loads.next().expect("a load per parcel");
+            let (cuts, aims) = p.cuts(n, plan)?;
+            load.extra = p.extra_crossings(n, &cuts);
+            Ok((p, cuts, aims))
+        })
+        .collect();
+    check_division(&parcels, budget::TOOL_FUEL.saturating_sub(failed), too_much)?;
     let mut out = Vec::new();
     let mut messages = Vec::new();
+    let mut unlisted = 0usize;
     let (mut divided, mut max_err) = (0usize, 0.0f64);
-    for (i, (f, prep)) in feats.iter().zip(prepared).enumerate() {
+    for (i, (f, prep)) in feats.iter().zip(planned).enumerate() {
         let src = f.get("id").filter(|v| !v.is_null()).cloned().unwrap_or(json!(i));
         let label = match &src {
             Value::String(s) => s.clone(),
             v => v.to_string(),
         };
-        let parts = match prep.and_then(|(p, _)| p.divide(n, plan)) {
+        let parts = match prep.and_then(|(p, cuts, aims)| p.divide_at(n, plan, cuts, aims)) {
             Ok(p) => p,
-            Err(e) => {
+            Err(e) if messages.len() < MAX_PARCEL_MESSAGES => {
                 messages.push(format!("Parcel {label} skipped: {e}."));
+                continue;
+            }
+            Err(_) => {
+                unlisted += 1;
                 continue;
             }
         };
@@ -1094,9 +1281,12 @@ pub fn divide_parcel_tool(req: &Request) -> Res<Value> {
             max_err = max_err.max(p.error());
         }
         divided += 1;
-        if messages.len() < 150 {
+        if messages.len() < MAX_PARCEL_MESSAGES {
             messages.push(format!("Parcel {label}: {} parts, {} m².", parts.len(), areas_text(&parts)));
         }
+    }
+    if unlisted > 0 {
+        messages.push(format!("… and {unlisted} more parcels skipped."));
     }
     if out.is_empty() {
         let why = messages.first().cloned().unwrap_or_else(|| "the layer has no features".into());

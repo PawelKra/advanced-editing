@@ -1339,6 +1339,12 @@ pub fn share_within<'a>(
     if fuel.out { Err(fuel.why.clone()) } else { Ok(()) }
 }
 
+/// What [`share_within`] is charged for `new` vertices and results of `coords` vertices in
+/// all, besides looking at the new vertices near each segment.
+pub fn share_fuel(new: usize, coords: usize) -> u64 {
+    new as u64 * LOOKUP_FUEL + coords as u64 * SHARE_FUEL_PER_SEGMENT
+}
+
 /// Finds, for each new vertex placed on an original edge, the features that are not edited
 /// and whose boundary runs along that edge through the vertex: a segment of theirs lies on
 /// the edge's line (within [`TOOL_SNAP_M`]) and passes within [`EDGE_TOL_M`] of the vertex,
@@ -1347,8 +1353,9 @@ pub fn share_within<'a>(
 /// The host cannot read by area, so each layer is read whole: the edited layers first, then
 /// the other visible layers of the same dimension, as long as reading them, looking at the
 /// new vertices near their segments and inserting the vertices found fits the command's
-/// budget. A layer that does not fit is left as it is and named in [`Shared::skipped`].
-pub fn plan(on: bool, scope: &Scope, new: &[NewVertex]) -> Res<Shared> {
+/// budget and what is left of its `read` allowance. A layer that does not fit is left as it
+/// is and named in [`Shared::skipped`].
+pub fn plan(on: bool, scope: &Scope, new: &[NewVertex], read: &mut budget::ReadAllowance) -> Res<Shared> {
     let mut out = Shared::default();
     if !on || new.is_empty() {
         return Ok(out);
@@ -1372,7 +1379,7 @@ pub fn plan(on: bool, scope: &Scope, new: &[NewVertex]) -> Res<Shared> {
         }
         let per_byte = budget::READ_FUEL_PER_BYTE * if scope.read_whole == Some(layer.id) { 2 } else { 1 };
         let max_bytes = (fuel_left / per_byte).min(budget::MAX_READ_BYTES as u64) as usize;
-        let Some((feats, bytes)) = host_io::all_features_within(layer, LAYER_READ_CAP, max_bytes)? else {
+        let Some((feats, bytes)) = host_io::all_features_within(layer, LAYER_READ_CAP, max_bytes, read)? else {
             out.skipped.push(layer.name.clone());
             continue;
         };

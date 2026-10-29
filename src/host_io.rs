@@ -26,16 +26,27 @@ unsafe extern "C" {
 
 /// Sends a request (a JSON text) and returns the raw reply bytes.
 pub fn call_text(op: &str, req: &str) -> Res<Vec<u8>> {
+    Ok(call_text_within(op, req, usize::MAX)?.unwrap_or_default())
+}
+
+/// Sends a request and returns the raw reply bytes, or `Err(length)` when the reply is over
+/// `max` bytes. Such a reply is never allocated or copied into the module's memory, so even
+/// one larger than the memory can hold is refused with a message: RustGIS keeps only the
+/// last call's reply and replaces it on the next `call`, `result` merely copies it.
+pub fn call_text_within(op: &str, req: &str, max: usize) -> Res<Result<Vec<u8>, usize>> {
     // SAFETY: the host reads `len` bytes at `ptr`, which `req` owns for the call.
     let n = unsafe { host_call(req.as_ptr(), req.len()) };
     let len = usize::try_from(n).map_err(|_| format!("{op}: RustGIS didn't answer"))?;
+    if len > max {
+        return Ok(Err(len));
+    }
     let mut buf: Vec<u8> = Vec::with_capacity(len);
     // SAFETY: the host writes exactly `len` bytes (the reply it measured) into the capacity.
     unsafe {
         host_result(buf.as_mut_ptr());
         buf.set_len(len);
     }
-    Ok(buf)
+    Ok(Ok(buf))
 }
 
 /// `host::call` without the SDK's copy of the reply: the `ok` value is moved out, which
@@ -247,9 +258,16 @@ fn features_text(buf: &[u8], props: bool) -> Res<Vec<Feature>> {
 }
 
 /// Reads features of a layer, refusing replies over [`budget::MAX_READ_BYTES`] before
-/// parsing them. `what` names the features in that message ("the selected features of
-/// 'parcels'").
+/// copying or parsing them. `what` names the features in that message ("the selected
+/// features of 'parcels'").
 pub fn features_named(layer: i64, q: Query, what: &str) -> Res<Vec<Feature>> {
+    features_within(layer, q, what, &mut budget::ReadAllowance::new())
+}
+
+/// [`features_named`] within what is left of a command's `read` allowance, which the reply is
+/// then counted against: a command reading several layers refuses the one that would take
+/// its reads over [`budget::MAX_READ_BYTES`] before copying or parsing it.
+pub fn features_within(layer: i64, q: Query, what: &str, read: &mut budget::ReadAllowance) -> Res<Vec<Feature>> {
     let mut p = json!({"layer": layer});
     if q.selected {
         p["selected"] = json!(true);
@@ -258,8 +276,11 @@ pub fn features_named(layer: i64, q: Query, what: &str) -> Res<Vec<Feature>> {
         p["limit"] = json!(n);
     }
     let req = json!({"op": "host.features", "params": p}).to_string();
-    let buf = call_text("host.features", &req)?;
-    budget::check_read(buf.len(), what)?;
+    let buf = match call_text_within("host.features", &req, read.left())? {
+        Ok(buf) => buf,
+        Err(len) => return Err(read.refusal(len, what)),
+    };
+    read.take(buf.len());
     if let Ok(v) = features_text(&buf, q.properties) {
         return Ok(v);
     }
@@ -287,11 +308,21 @@ pub fn selected_features(layer: i64, properties: bool) -> Res<Vec<Feature>> {
 /// [`LAYER_READ_CAP`]) or more data than [`budget::MAX_READ_BYTES`], with a message that
 /// tells the user to select instead.
 pub fn all_features_capped(layer: &LayerInfo, cap: usize, properties: bool) -> Res<Vec<Feature>> {
+    all_features_capped_within(layer, cap, properties, &mut budget::ReadAllowance::new())
+}
+
+/// [`all_features_capped`] within a command's `read` allowance (see [`features_within`]).
+pub fn all_features_capped_within(
+    layer: &LayerInfo,
+    cap: usize,
+    properties: bool,
+    read: &mut budget::ReadAllowance,
+) -> Res<Vec<Feature>> {
     if layer.features > cap {
         return Err(too_big(layer, cap));
     }
     let q = Query { selected: false, limit: Some(cap.saturating_add(1)), properties };
-    let v = features_named(layer.id, q, &format!("the {} features of '{}'", layer.features, layer.name))?;
+    let v = features_within(layer.id, q, &format!("the {} features of '{}'", layer.features, layer.name), read)?;
     if v.len() > cap {
         return Err(too_big(layer, cap));
     }
@@ -299,19 +330,25 @@ pub fn all_features_capped(layer: &LayerInfo, cap: usize, properties: bool) -> R
 }
 
 /// Every feature of a layer and the size of the reply, or `None` when the reply is over
-/// `max_bytes` (it is then not parsed, which is what would cost fuel) or the layer has more
-/// than `cap` features. For optional reads that a command skips rather than fails on.
-pub fn all_features_within(layer: &LayerInfo, cap: usize, max_bytes: usize) -> Res<Option<(Vec<Feature>, usize)>> {
+/// `max_bytes` or over what is left of the command's `read` allowance (it is then neither
+/// copied nor parsed) or the layer has more than `cap` features. A reply read is counted
+/// against `read`. For optional reads that a command skips rather than fails on.
+pub fn all_features_within(
+    layer: &LayerInfo,
+    cap: usize,
+    max_bytes: usize,
+    read: &mut budget::ReadAllowance,
+) -> Res<Option<(Vec<Feature>, usize)>> {
     if layer.features > cap {
         return Ok(None);
     }
     let p = json!({"layer": layer.id, "limit": cap.saturating_add(1)});
     let req = json!({"op": "host.features", "params": p}).to_string();
-    let buf = call_text("host.features", &req)?;
-    let bytes = buf.len();
-    if bytes > max_bytes {
+    let Ok(buf) = call_text_within("host.features", &req, max_bytes.min(read.left()))? else {
         return Ok(None);
-    }
+    };
+    let bytes = buf.len();
+    read.take(bytes);
     let v = match features_text(&buf, false) {
         Ok(v) => v,
         Err(_) => {
@@ -609,11 +646,45 @@ pub mod budget {
         if bytes <= MAX_READ_BYTES {
             return Ok(());
         }
-        Err(format!(
-            "Reading {what} means {:.1} MB of data; one command reads about {:.1} MB. Select fewer features.",
-            bytes as f64 / 1e6,
-            MAX_READ_BYTES as f64 / 1e6
-        ))
+        Err(ReadAllowance::new().refusal(bytes, what))
+    }
+
+    /// The `host.features` replies a command has read: together they stay within
+    /// [`MAX_READ_BYTES`], however many layers they come from.
+    #[derive(Clone, Copy, Debug, Default)]
+    pub struct ReadAllowance {
+        /// Bytes read so far.
+        pub read: usize,
+    }
+
+    impl ReadAllowance {
+        pub const fn new() -> ReadAllowance {
+            ReadAllowance { read: 0 }
+        }
+
+        /// The largest reply the command may still read.
+        pub fn left(&self) -> usize {
+            MAX_READ_BYTES.saturating_sub(self.read)
+        }
+
+        /// Counts a reply that was within [`left`](Self::left).
+        pub fn take(&mut self, bytes: usize) {
+            self.read += bytes;
+        }
+
+        /// The refusal of a reply of `bytes` over what is left; `what` names it.
+        pub fn refusal(&self, bytes: usize, what: &str) -> String {
+            let before = if self.read > 0 {
+                format!(" on top of the {:.1} MB already read", self.read as f64 / 1e6)
+            } else {
+                String::new()
+            };
+            format!(
+                "Reading {what} means {:.1} MB of data{before}; one command reads about {:.1} MB. Select fewer features.",
+                bytes as f64 / 1e6,
+                MAX_READ_BYTES as f64 / 1e6
+            )
+        }
     }
 
     /// Refuses editing `features` with `vertices` in total within one command.

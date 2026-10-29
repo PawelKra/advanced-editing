@@ -133,25 +133,33 @@ def true_areas(geoms, frame, size_m):
 
 # ---------- checks ----------
 
+# The reported part areas agree with the geodesic area within 1.2e-9 of the part, measured
+# (README, Accuracy); asserted with some margin. They are rounded to 4 decimals, which adds
+# up to half of 1e-4 m².
+REPORTED_REL = 1.5e-9
+REPORTED_ROUNDING = 0.5e-4
+
 def check_division(name, geoms, reported, max_error, frame, size_m, shares):
     """Each part within the tolerance of its share, measured independently; the reported
     areas agree with that measure and the reported largest error is not understated."""
     true = true_areas(geoms, frame, size_m)
     total = sum(true)
-    dev = diff = 0.0
+    dev = diff = ratio = 0.0
     for i, (a, rep, sh) in enumerate(zip(true, reported, shares)):
         want = total * sh
         dev = max(dev, abs(a - want))
         diff = max(diff, abs(rep - a))
+        ratio = max(ratio, abs(rep - a) / a)
         check(abs(a - want) <= tol(want), '%s part %d: %.4f m², its share is %.4f (tolerance %.4f)'
               % (name, i, a, want, tol(want)))
-        check(abs(rep - a) <= 0.01 * tol(a), '%s part %d: reported %.4f m², independently %.4f'
-              % (name, i, rep, a))
+        check(abs(rep - a) <= REPORTED_REL * a + REPORTED_ROUNDING,
+              '%s part %d: reported %.4f m², independently %.4f (%.2g of the part)'
+              % (name, i, rep, a, abs(rep - a) / a))
     check(dev <= max_error + 0.01 * tol(total * min(shares)),
           '%s: largest deviation %.4f m², reported %.4f' % (name, dev, max_error))
     print('      %s in %s: parts of %.4g m², largest deviation %.3g m² (%.1e), reported %.3g m²; '
-          'reported areas within %.2g m²' % (name, frame.name(), total * min(shares), dev,
-                                              dev / (total * min(shares)), max_error, diff))
+          'reported areas within %.2g m² (%.1e)' % (name, frame.name(), total * min(shares), dev,
+                                                     dev / (total * min(shares)), max_error, diff, ratio))
 
 
 # Squares centred far from the central meridian of their frame: EPSG:2180 near Poland's

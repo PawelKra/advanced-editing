@@ -74,6 +74,119 @@ def test_read_guard_refuses_a_large_reply():
         check(r['ids'] == [1], r)
 
 
+def test_read_guard_refuses_before_copying_the_reply():
+    # the reply's length alone refuses it: the module's memory doesn't grow by the 1.4 MB, and
+    # the next host call gets its own reply
+    with Session(blob_layer('blobs', 35, 1000)) as s:
+        lid = s.layer_id('blobs')
+        first = s.features('blobs')[0]['id']
+        r = s.plugin('diag-features', {'layer': lid, 'readLeft': 1_200_000})
+        check(r['error'] == 'Reading the test features means 1.4 MB of data; one command reads about 1.2 MB. '
+                            'Select fewer features.', r)
+        check(r['count'] is None and r['grownBytes'] < 500_000, r)
+        check(r['nextIds'] == [first], r)
+        # a reply within what is left is read and counted
+        r = s.plugin('diag-features', {'layer': lid, 'readLeft': 1_200_000, 'limit': 5})
+        check(r['error'] is None and r['count'] == 5 and r['nextIds'] == [first], r)
+        r = s.plugin('diag-features', {'layer': lid, 'readLeft': 1000, 'limit': 5})
+        check('means 0.2 MB of data on top of the 1.2 MB already read;' in r['error'], r)
+        check(r['grownBytes'] < 100_000 and r['nextIds'] == [first], r)
+
+
+def fat_layer(name, k, x0, kb=45):
+    """k small squares carrying `kb` kB of text each: a large reply with few vertices."""
+    lon, lat = PL
+    return write_layer(name, [feature(polygon(rect(lon, lat, 50, 50, x0 + 100 * i, 0)), note='x' * (kb * 1000), n=i)
+                              for i in range(k)])
+
+
+def test_read_guard_counts_every_layer_a_command_reads():
+    # three target layers of about 0.45 MB each: each fits the read guard, together they don't
+    lon, lat = PL
+    cutter = write_layer('cutter', [feature(polygon(rect(lon, lat, 3000, 30, -50, 10)), name='cut')])
+    with Session(fat_layer('f1', 10, 0), fat_layer('f2', 10, 1000), fat_layer('f3', 10, 2000), cutter) as s:
+        for name in ['f1', 'f2', 'f3']:
+            s.select(name, range(10), add=True)
+        s.activate('cutter')
+        s.select('cutter', [0], add=True)
+        before = [s.features(n) for n in ['f1', 'f2', 'f3']]
+        e = s.error_of('cut-with-polygon', {'keepTools': True})
+        check('Reading the 10 selected features of ' in e and 'MB already read; one command reads about 1.2 MB. '
+              'Select fewer features.' in e, e)
+        check([s.features(n) for n in ['f1', 'f2', 'f3']] == before, 'a refused command changed the data')
+        # two of them fit
+        s.clear_selection()
+        for name in ['f1', 'f2']:
+            s.select(name, range(10), add=True)
+        s.activate('cutter')
+        s.select('cutter', [0], add=True)
+        r = s.plugin('cut-with-polygon', {'keepTools': True})
+        check('Cut 20' in r['message'], r)
+    # locators of Delete Ring count on top of the polygons the command edits
+    holed = write_layer('holed', [feature(polygon(rect(lon, lat, 100, 100, -500, 0),
+                                                  list(reversed(rect(lon, lat, 40, 40, -470, 30)))),
+                                          note='x' * 300_000)])
+    with Session(holed, fat_layer('f1', 10, 0), fat_layer('f2', 10, 1000)) as s:
+        s.activate('holed')
+        s.select('holed', [0])
+        for name in ['f1', 'f2']:
+            s.select(name, range(10), add=True)
+        e = s.error_of('delete-ring')
+        check('Reading the 10 selected features of ' in e and 'MB already read; one command reads about 1.2 MB' in e, e)
+
+
+def test_fill_ring_island_search_counts_on_top_of_the_command_reads():
+    # the holed polygon (0.5 MB) and its locators (0.45 MB) are read; the layer (0.6 MB) fits
+    # on top of the polygon, not on top of both, so the island search is skipped with its note
+    lon, lat = PL
+    holed = feature(polygon(rect(lon, lat, 400, 400, -150, -150), list(reversed(rect(lon, lat, 300, 300, -100, -100)))),
+                    note='x' * 500_000)
+    island = feature(polygon(rect(lon, lat, 20, 20, 60, 60)), note='y' * 100_000)
+    with Session(write_layer('holed', [holed, island]), fat_layer('f1', 10, 0)) as s:
+        s.select('f1', range(10))
+        s.activate('holed')
+        s.select('holed', [0], add=True)
+        r = s.plugin('fill-ring')
+        check(r['created'] == 1 and r['islands'] == 0 and not r['layerChecked'], r)
+        check('the layer is too large to check its unselected polygons for islands' in r['message'], r['message'])
+        s.undo()
+        # without the locators the layer fits and the island is left out
+        s.clear_selection()
+        s.activate('holed')
+        s.select('holed', [0])
+        r = s.plugin('fill-ring')
+        check(r['created'] == 1 and r['islands'] == 1 and r['layerChecked'], r)
+
+
+def test_trim_extend_layer_search_counts_on_top_of_the_tool():
+    # the tool line (0.6 MB) is read first: the layer (0.85 MB) fits the read guard alone,
+    # not on top of it
+    lon, lat = PL
+    tool = feature(linestring(lon, lat, [(0, -100), (0, 100)]), note='x' * 600_000)
+    stubs = [feature(linestring(lon, lat, [(-50, 10 * i), (-5, 10 * i)]), note='y' * 50_000) for i in range(5)]
+    with Session(write_layer('tl', [tool] + stubs)) as s:
+        s.activate('tl')
+        s.select('tl', [0])
+        before = s.features('tl')
+        e = s.error_of('trim-extend')
+        check("Reading the 6 features of 'tl' means 0.9 MB of data on top of the 0.6 MB already read" in e, e)
+        check(s.features('tl') == before, 'a refused command changed the data')
+
+
+def test_topological_editing_counts_on_top_of_the_command_reads():
+    # 10 of 20 fat squares (0.45 MB) are cut; their layer (0.9 MB) fits the read guard alone,
+    # not on top of them, so their neighbours are not searched and the message says so
+    lon, lat = PL
+    cutter = write_layer('cutter', [feature(polygon(rect(lon, lat, 1000, 30, -50, 10)), name='cut')])
+    with Session(fat_layer('f1', 20, 0), cutter) as s:
+        s.select('f1', range(10))
+        s.activate('cutter')
+        s.select('cutter', [0], add=True)
+        r = s.plugin('cut-with-polygon', {'keepTools': True})
+        check('Cut 10' in r['message'], r)
+        check("shared vertices not added in 'f1': the layer is too large to search" in r['message'], r['message'])
+
+
 # ---------- projection ----------
 
 getcontext().prec = 45
@@ -290,3 +403,115 @@ def test_readme_limits_match_the_budget():
     for f in sorted((REPO / 'src').glob('*.rs')):
         for name in re.findall(r'const (\w*VERTICES\w*): usize = \d', f.read_text()):
             check(name == 'MAX_VALIDATE_VERTICES', '%s: %s' % (f.name, name))
+
+
+# ---------- polygon overlays ----------
+
+def test_add_ring_with_many_tools_and_targets_is_refused_up_front():
+    # 1000 small squares in the empty half of 1000 triangles' common box: each tool would be
+    # compared with each target, a million boolean ops on 9000 vertices in all
+    import time
+    lon, lat = PL
+    tri = [offset_m(lon, lat, x, y) for x, y in [(0, 0), (1000, 0), (0, 1000), (0, 0)]]
+    targets = write_layer('targets', [feature(polygon(tri), n=i) for i in range(1000)])
+    tools = write_layer('tools', [feature(polygon(rect(lon, lat, 5, 5, 600 + 11 * (i % 32), 600 + 11 * (i // 32))), n=i)
+                                  for i in range(1000)])
+    t = time.time()
+    with Session(targets, tools) as s:
+        s.select('targets', range(1000))
+        s.activate('tools')
+        s.select('tools', range(1000), add=True)
+        before = s.features('targets'), s.features('tools')
+        e = s.error_of('add-ring', {'keepTools': False})
+        check('Trying these polygons as holes in the targets is more than one command can do' in e
+              and 'ran too long' not in e, e)
+        check((s.features('targets'), s.features('tools')) == before, 'a refused command changed the data')
+    print('      1000 x 1000 refused in %.1fs' % (time.time() - t))
+
+
+def test_merge_and_fill_gap_of_a_comb_are_refused_up_front():
+    # a comb of 1500 teeth beside a square: the union compares every two of the teeth's edges,
+    # which overlap along x; 750 teeth still fit
+    import time
+    from test_topo import poly, sq
+    from test_topo_limits import comb
+    for teeth, refused in ((750, False), (1500, True)):
+        t = time.time()
+        with Session(write_layer('pl', [feature(poly(sq(0, 0)), name='A'), feature(comb(teeth), name='comb')])) as s:
+            s.activate('pl')
+            s.select('pl', [0, 1])
+            before = s.features('pl')
+            if not refused:
+                r = s.plugin('merge-with-attributes')
+                check(r['merged'] == 2, r)
+                continue
+            e = s.error_of('fill-gap')
+            check('Finding the gaps between these polygons is more than one command can do' in e
+                  and 'ran too long' not in e, e)
+            e = s.error_of('merge-with-attributes')
+            check('Merging these polygons is more than one command can do' in e and 'ran too long' not in e, e)
+            check(s.features('pl') == before, 'a refused command changed the data')
+        print('      %d teeth %s in %.1fs' % (teeth, 'refused' if refused else 'merged', time.time() - t))
+
+
+def test_simplify_of_stacked_holes_is_refused_up_front():
+    # narrow holes stacked one above another, all over the same x-range: checking the result
+    # for crossing rings compares every two of their segments. 320 holes fit; 3000 (about
+    # 15 000 vertices, within the edit guard) are refused before any change.
+    import time
+    lon, lat = PL
+
+    def stacked(k):
+        # the extra vertex on the outer ring's bottom edge is what simplifying removes
+        outer = rect(lon, lat, 100, 3 * k + 10, -10, -5)
+        outer.insert(1, offset_m(lon, lat, 40, -5.01))
+        return polygon(outer, *[rect(lon, lat, 80, 2, 0, 3 * i) for i in range(k)])
+
+    for k, refused in ((320, False), (3000, True)):
+        t = time.time()
+        with Session(write_layer('holes', [feature(stacked(k), name='h')])) as s:
+            s.activate('holes')
+            s.select('holes', [0])
+            before = s.features('holes')
+            if not refused:
+                r = s.plugin('simplify', {'tolerance': 0.5})
+                check(r['changed'] == 1 and r['verticesAfter'] == r['verticesBefore'] - 1, r)
+            else:
+                e = s.error_of('simplify', {'tolerance': 0.5})
+                check('Checking the results for crossing rings is more than one command can do' in e
+                      and 'Select fewer features' in e and 'ran too long' not in e, e)
+                check(s.features('holes') == before, 'a refused command changed the data')
+        print('      %d holes %s in %.1fs' % (k, 'refused' if refused else 'simplified', time.time() - t))
+
+
+def test_merge_and_fill_gap_of_a_dense_grid_are_refused_up_front():
+    # thin rectangles across thin rectangles, each pair crossing four times: the union resolves
+    # every crossing, which the comparisons of x ranges alone do not show (70 x 70 bars take
+    # more than the host allows)
+    import time
+    from test_topo import poly
+    from test_topo_limits import ll_ring
+
+    def bar(x0, y0, x1, y1):
+        return poly(ll_ring([(x0, y0), (x1, y0), (x1, y1), (x0, y1), (x0, y0)]))
+
+    for k, refused in ((40, False), (70, True)):
+        t = time.time()
+        n = 10.0 * k
+        feats = [feature(bar(-5, 10 * i, n, 10 * i + 1), name='h%d' % i) for i in range(k)]
+        feats += [feature(bar(10 * i, -5, 10 * i + 1, n), name='v%d' % i) for i in range(k)]
+        with Session(write_layer('pl', feats)) as s:
+            s.activate('pl')
+            s.select('pl', list(range(2 * k)))
+            before = s.features('pl')
+            if not refused:
+                r = s.plugin('merge-with-attributes')
+                check(r['merged'] == 2 * k, r)
+            else:
+                e = s.error_of('fill-gap')
+                check('Finding the gaps between these polygons is more than one command can do' in e
+                      and 'ran too long' not in e, e)
+                e = s.error_of('merge-with-attributes')
+                check('Merging these polygons is more than one command can do' in e and 'ran too long' not in e, e)
+                check(s.features('pl') == before, 'a refused command changed the data')
+        print('      %d x %d bars %s in %.1fs' % (k, k, 'refused' if refused else 'merged', time.time() - t))

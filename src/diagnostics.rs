@@ -21,6 +21,7 @@ pub fn dispatch(req: &Request) -> Option<Res<Value>> {
         "diag-settings" => Ok(settings(req)),
         "diag-layers" => layers(),
         "diag-bench" => bench(p),
+        "diag-divide-parcel" => divide_parcel(p),
         _ => return None,
     })
 }
@@ -170,6 +171,9 @@ fn features(p: &Value) -> Res<Value> {
         limit: p["limit"].as_u64().map(|n| n as usize),
         properties: p["properties"].as_bool().unwrap_or(false),
     };
+    if let Some(left) = p["readLeft"].as_u64() {
+        return read_left(layer, q, left as usize);
+    }
     let f = host_io::features(layer, q)?;
     // write every geometry back unchanged: the text written must parse to the same numbers
     if p["rewrite"].as_bool() == Some(true) {
@@ -183,6 +187,24 @@ fn features(p: &Value) -> Res<Value> {
         "rows": f.iter().map(|f| f.row).collect::<Vec<_>>(),
         "types": f.iter().map(|f| f.geometry.as_ref().map(|g| g.type_name())).collect::<Vec<_>>(),
         "props": f.iter().map(|f| Value::Object(f.properties.clone())).collect::<Vec<_>>(),
+    }))
+}
+
+/// Reads with only `left` bytes of the command's reads left, then reads the layer's first
+/// feature again: a refused reply must not grow the module's memory (it is never copied), and
+/// the next call must get its own reply.
+fn read_left(layer: i64, q: Query, left: usize) -> Res<Value> {
+    let pages = || core::arch::wasm32::memory_size(0) * 65536;
+    let before = pages();
+    let mut read = budget::ReadAllowance { read: budget::MAX_READ_BYTES.saturating_sub(left) };
+    let r = host_io::features_within(layer, q, "the test features", &mut read);
+    let grown = pages() - before;
+    let next = host_io::features(layer, Query { selected: false, limit: Some(1), properties: false })?;
+    Ok(json!({
+        "error": r.as_ref().err(),
+        "count": r.as_ref().ok().map(Vec::len),
+        "grownBytes": grown,
+        "nextIds": next.iter().map(|f| f.id).collect::<Vec<_>>(),
     }))
 }
 
@@ -291,6 +313,31 @@ fn layers() -> Res<Value> {
             })
             .collect(),
     ))
+}
+
+/// Runs the Divide Parcel tool on `features` (GeoJSON features, the layer "input") with the
+/// tool parameters `params`, within this command: its error, the number of output features,
+/// and how many parcels it started preparing, which shows the checks made before that.
+fn divide_parcel(p: &Value) -> Res<Value> {
+    use std::sync::atomic::Ordering;
+    let mut params = p["params"].clone();
+    params["input"] = json!("input");
+    let mut layers = Map::new();
+    layers.insert("input".into(), json!({"type": "FeatureCollection", "features": p["features"].clone()}));
+    let req = Request {
+        kind: rustgis_plugin::Kind::Tool,
+        id: "divide-parcel".into(),
+        params,
+        layers,
+        files: Map::new(),
+        lang: "en".into(),
+        panel: Map::new(),
+        panel_changed: Vec::new(),
+    };
+    crate::division::PREPARED.store(0, Ordering::Relaxed);
+    let r = crate::division::divide_parcel_tool(&req);
+    let out = r.as_ref().ok().map(|v| v.to_string().matches("\"Feature\"").count());
+    Ok(json!({"error": r.err(), "features": out, "prepared": crate::division::PREPARED.load(Ordering::Relaxed)}))
 }
 
 /// A closed ring of `n` vertices around (19, 52) with full-precision coordinates.

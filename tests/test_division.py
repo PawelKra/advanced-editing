@@ -9,6 +9,7 @@ equal-area projection (authalic latitude)."""
 import json
 import math
 import os
+import time
 
 from aelib import (ABROAD, PL, PREFIX, CommandError, Session, Skip, check, feature, linestring,
                    multipolygon, offset_m, polygon, rect, run_once, tmpdir, write_layer)
@@ -496,6 +497,57 @@ def test_division_budget_counts_long_edges():
         check(max(r['areas'][0]) - min(r['areas'][0]) <= 2e-6 * max(r['areas'][0]), r['areas'])
 
 
+def comb(teeth, h=100.0):
+    """A comb of 4 * teeth + 1 vertices: teeth 1 m wide and h m long, 1 m apart, on a 2 m back
+    along y = 0; lines at 90° cut across every tooth."""
+    lon, lat = PL
+    pts = [(0, 0), (2 * teeth - 1, 0)]
+    for i in reversed(range(teeth)):
+        pts += [(2 * i + 1, h), (2 * i, h)] + ([(2 * i, 2), (2 * i - 1, 2)] if i else [])
+    ring = [offset_m(lon, lat, x, y) for x, y in pts]
+    return ring + ring[:1]
+
+
+def test_division_budget_counts_crossings():
+    # 49 cuts across 250 teeth would cross the edges some 25 000 times: refused once the cuts
+    # are placed, before slicing; 3 parts cross them 1 000 times and fit
+    g = polygon(comb(250))
+    with Session(write_layer('comb', [feature(g, name='comb')])) as s:
+        s.activate('comb')
+        s.select('comb', [0])
+        before = s.features('comb')
+        for parts in (50, 4):
+            t = time.time()
+            e = s.error_of('divide-equal', {'parts': parts, 'angle': 90})
+            check('Dividing 1 polygon(s) with 1 001 vertices into %d parts is more than one command can do' % parts
+                  in e, e)
+            check(time.time() - t < 5, 'refused after %.1f s' % (time.time() - t))
+            check(s.features('comb') == before, 'a refused division changed the data')
+        r = s.plugin('divide-equal', {'parts': 3, 'angle': 90})
+        check(r['divided'] == 1 and r['created'] == 2, r)
+        check_parts_equal([f['geometry'] for f in s.features('comb')], area_ell(g), 3)
+
+
+def test_division_near_the_limit_leaves_no_room_to_search_neighbours():
+    # 235 parcels of 21 vertices into 2 parts take nearly the whole command: the 1.1 MB
+    # neighbour layer is not read for shared vertices, rather than running out of budget
+    nb = write_layer('nb', [feature(polygon(wavy(300 * i, 900)), n=i) for i in range(30)])
+    with Session(wavy_layer('parcels', 235, 20), nb) as s:
+        s.activate('parcels')
+        s.select('parcels', range(235))
+        before = s.features('nb')
+        r = s.plugin('divide-equal', {'parts': 2})
+        check(r['divided'] == 235 and r['created'] == 235, r)
+        check("shared vertices not added in 'nb': the layer is too large to search" in r['message'], r['message'])
+        check(s.features('nb') == before, 'a neighbour changed')
+    # 20 of those parcels leave room to search it
+    with Session(wavy_layer('parcels', 20, 20), nb) as s:
+        s.activate('parcels')
+        s.select('parcels', range(20))
+        r = s.plugin('divide-equal', {'parts': 2})
+        check(r['divided'] == 20 and 'not added' not in r['message'], r)
+
+
 # ---------- divide-parcel (tool) ----------
 
 def tool(s, **params):
@@ -647,6 +699,74 @@ def test_tool_budget():
             check('Dividing 1 polygon(s) with 5 vertices into about 5 000 parts is more than one run of the tool '
                   'can do' in str(e), str(e))
         check('shapes divided' not in s.layers(), 'a refused tool added a layer')
+
+
+def test_tool_lists_skipped_parcels_up_to_a_limit():
+    lon, lat = PL
+    flat = polygon([offset_m(lon, lat, 10, 10)] * 4)
+    feats = [feature(polygon(rect(lon, lat, 100, 100)), name='ok')] + [feature(flat, name='flat')] * 300
+    with Session(write_layer('shapes', feats)) as s:
+        r = tool(s, count=2)
+        notes = r['notices']
+        check(notes[0].startswith('Divided 1 of 301 parcels into 2 parts'), notes[0])
+        check(len(notes) == 152 and notes[1].startswith('Parcel 1: 2 parts'), notes[:3])
+        check(all('skipped' in m for m in notes[2:151]), notes[2:4])
+        check(notes[-1] == '… and 151 more parcels skipped.', notes[-1])
+        check(len(s.features('shapes divided')) == 2, 'parts')
+
+
+def divide_in_command(s, feats, **params):
+    """The tool run within one diagnostic command: its error, its output features and how many
+    parcels it started preparing."""
+    return s.plugin('diag-divide-parcel', {'features': feats, 'params': params})
+
+
+def test_tool_refuses_too_big_an_input_before_preparing_it():
+    # 4 wavy parcels of 2001 vertices into 1000 parts each: refused from the input's size
+    feats = [feature(polygon(wavy(300 * i, 2000)), n=i) for i in range(4)]
+    msg = ('Dividing 4 polygon(s) with 8 004 vertices into about 4 000 parts is more than one run of the '
+           'tool can do')
+    with Session(write_layer('shapes', feats)) as s:
+        try:
+            tool(s, count=1000)
+            raise AssertionError('the tool accepted 4 parcels of 2001 vertices into 1000 parts')
+        except CommandError as e:
+            check(msg in str(e), str(e))
+        check('shapes divided' not in s.layers(), 'a refused tool added a layer')
+        # no parcel was prepared before the refusal; the same run prepares them when it fits
+        r = divide_in_command(s, feats, count=1000)
+        check(msg in (r['error'] or '') and r['prepared'] == 0, r)
+        r = divide_in_command(s, feats[:2], count=2)
+        check(r['error'] is None and r['prepared'] == 2 and r['features'] == 4, r)
+
+
+def test_tool_refuses_a_too_large_output_before_preparing():
+    # every part gets its parcel's attributes: 1000 parts of a parcel with 1 MB of text would
+    # make a 1 GB layer
+    lon, lat = PL
+    feats = [feature(polygon(rect(lon, lat, 100, 100)), name='big', note='x' * 1_000_000)]
+    with Session(write_layer('shapes', feats)) as s:
+        try:
+            tool(s, count=1000)
+            raise AssertionError('the tool accepted 1000 parts of a parcel with 1 MB of attributes')
+        except CommandError as e:
+            check('Dividing 1 polygon(s) into about 1 000 parts would make a layer of about 1 001 MB' in str(e)
+                  and 'one run of the tool makes at most 64 MB' in str(e), str(e))
+        check('shapes divided' not in s.layers(), 'a refused tool added a layer')
+        r = divide_in_command(s, feats, count=1000)
+        check('would make a layer of about' in (r['error'] or '') and r['prepared'] == 0, r)
+        # parts of a given area are counted once the parcel's area is known, still before
+        # it is cut
+        try:
+            tool(s, mode='Parts of given area', area=10)
+            raise AssertionError('the tool accepted parts of 10 m² of a parcel with 1 MB of attributes')
+        except CommandError as e:
+            check('parts would make a layer of about' in str(e), str(e))
+        check('shapes divided' not in s.layers(), 'a refused tool added a layer')
+        # a few parts are made, each with the attributes
+        tool(s, count=3)
+        out = s.features('shapes divided')
+        check(len(out) == 3 and all(len(f['properties']['note']) == 1_000_000 for f in out), len(out))
 
 
 # ---------- real data ----------

@@ -73,6 +73,8 @@ pub struct Selection {
     /// `targets_from_active`).
     pub targets: Vec<TargetSet>,
     pub targets_from_active: bool,
+    /// What reading the tools and targets took of the command's reads, for its further reads.
+    pub read: budget::ReadAllowance,
 }
 
 impl Selection {
@@ -108,9 +110,9 @@ fn misfit(usage: &str, why: String) -> String {
     format!("{usage}. ({why})")
 }
 
-fn read_selected(layer: &LayerInfo, properties: bool) -> Res<Vec<Feature>> {
+fn read_selected(layer: &LayerInfo, properties: bool, read: &mut budget::ReadAllowance) -> Res<Vec<Feature>> {
     let q = Query { selected: true, limit: None, properties };
-    host_io::features_named(layer.id, q, &format!("the {} selected features of '{}'", layer.selected, layer.name))
+    host_io::features_within(layer.id, q, &format!("the {} selected features of '{}'", layer.selected, layer.name), read)
 }
 
 /// Resolves the selection into tool and target features, or fails with the spec's usage
@@ -134,7 +136,9 @@ pub fn gather(spec: &ToolSpec) -> Res<Selection> {
     if active.selected > LAYER_READ_CAP {
         return Err(misfit(spec.usage, format!("{} features are selected in '{}'", active.selected, active.name)));
     }
-    let tools: Vec<Feature> = read_selected(&active, spec.tool_properties)?
+    // the tools and every target layer are read within one allowance
+    let mut read = budget::ReadAllowance::new();
+    let tools: Vec<Feature> = read_selected(&active, spec.tool_properties, &mut read)?
         .into_iter()
         .filter(|f| f.geometry.is_some())
         .collect();
@@ -161,7 +165,7 @@ pub fn gather(spec: &ToolSpec) -> Res<Selection> {
             if l.selected > LAYER_READ_CAP {
                 return Err(misfit(spec.usage, format!("{} features are selected in '{}'", l.selected, l.name)));
             }
-            let feats: Vec<Feature> = read_selected(l, spec.target_properties)?
+            let feats: Vec<Feature> = read_selected(l, spec.target_properties, &mut read)?
                 .into_iter()
                 .filter(|f| f.geometry.is_some())
                 .collect();
@@ -170,7 +174,7 @@ pub fn gather(spec: &ToolSpec) -> Res<Selection> {
             }
         }
     } else if spec.target_dims.contains(&adim) {
-        let feats = intersecting(&active, &tools, spec.target_properties)?;
+        let feats = intersecting(&active, &tools, spec.target_properties, &mut read)?;
         if !feats.is_empty() {
             targets.push(TargetSet { layer: active.clone(), features: feats });
         }
@@ -191,14 +195,19 @@ pub fn gather(spec: &ToolSpec) -> Res<Selection> {
         };
         return Err(misfit(spec.usage, why));
     }
-    Ok(Selection { layers, active, tools, targets, targets_from_active: from_active })
+    Ok(Selection { layers, active, tools, targets, targets_from_active: from_active, read })
 }
 
 /// Features of `layer` (all of it, capped) intersecting any of `tools`, the tools excluded.
 /// Each geometry is taken in one piece across the antimeridian (see [`in_one_piece`]) and
 /// compared with the tools also a turn east and west, so a tool at 179.95°E finds a target
 /// running from 179.9°E to 179.9°W.
-fn intersecting(layer: &LayerInfo, tools: &[Feature], properties: bool) -> Res<Vec<Feature>> {
+fn intersecting(
+    layer: &LayerInfo,
+    tools: &[Feature],
+    properties: bool,
+    read: &mut budget::ReadAllowance,
+) -> Res<Vec<Feature>> {
     let tool_geo: Vec<(Rect<f64>, geo::Geometry<f64>)> = tools
         .iter()
         .filter_map(|t| t.geometry.as_ref())
@@ -207,7 +216,7 @@ fn intersecting(layer: &LayerInfo, tools: &[Feature], properties: bool) -> Res<V
             Some((bb, tg.unwrap_or_else(|| g.to_geo())))
         })
         .collect();
-    let all = host_io::all_features_capped(layer, LAYER_READ_CAP, properties)?;
+    let all = host_io::all_features_capped_within(layer, LAYER_READ_CAP, properties, read)?;
     Ok(all
         .into_iter()
         .filter(|f| !tools.iter().any(|t| t.id == f.id))
@@ -229,12 +238,12 @@ fn intersecting(layer: &LayerInfo, tools: &[Feature], properties: bool) -> Res<V
 }
 
 /// Longitude shifts under which two geometries in one piece may meet.
-const TURNS: [f64; 3] = [0.0, 360.0, -360.0];
+pub(crate) const TURNS: [f64; 3] = [0.0, 360.0, -360.0];
 
 /// The lon/lat box of `g` with its longitudes taken within 180° of its first one, so that a
 /// geometry across the antimeridian is one piece (its box may then reach beyond 180°), and
 /// that geometry when it differs from `g` (`None`: use `g` as it is).
-fn in_one_piece(g: &Geom) -> Option<(Rect<f64>, Option<geo::Geometry<f64>>)> {
+pub(crate) fn in_one_piece(g: &Geom) -> Option<(Rect<f64>, Option<geo::Geometry<f64>>)> {
     let bb = g.bbox()?;
     // all longitudes within 180° of each other: already in one piece
     if bb.width() < 180.0 {
@@ -271,6 +280,8 @@ pub struct Editable {
     pub layers: Vec<LayerInfo>,
     pub layer: LayerInfo,
     pub features: Vec<Feature>,
+    /// What reading them took of the command's reads, for the command's further reads.
+    pub read: budget::ReadAllowance,
 }
 
 impl Editable {
@@ -293,8 +304,9 @@ pub fn active_features(spec: &EditSpec) -> Res<Editable> {
             format!("the active layer '{}' holds {}s, this works on {}", layer.name, dim.noun(), dims_text(spec.dims)),
         ));
     }
+    let mut read = budget::ReadAllowance::new();
     let features: Vec<Feature> = if spec.whole_layer {
-        host_io::all_features_capped(&layer, LAYER_READ_CAP, spec.properties)?
+        host_io::all_features_capped_within(&layer, LAYER_READ_CAP, spec.properties, &mut read)?
     } else {
         if layer.selected == 0 {
             return Err(misfit(spec.usage, format!("nothing is selected in the active layer '{}'", layer.name)));
@@ -302,7 +314,7 @@ pub fn active_features(spec: &EditSpec) -> Res<Editable> {
         if layer.selected > LAYER_READ_CAP {
             return Err(misfit(spec.usage, format!("{} features are selected in '{}'", layer.selected, layer.name)));
         }
-        read_selected(&layer, spec.properties)?
+        read_selected(&layer, spec.properties, &mut read)?
     };
     let features: Vec<Feature> = features.into_iter().filter(|f| f.geometry.is_some()).collect();
     budget::check_edit(features.len(), budget::vertices(&features))?;
@@ -312,5 +324,5 @@ pub fn active_features(spec: &EditSpec) -> Res<Editable> {
             format!("{} {} feature(s) to work on in the active layer '{}'", features.len(), dim.noun(), layer.name),
         ));
     }
-    Ok(Editable { layers, layer, features })
+    Ok(Editable { layers, layer, features, read })
 }

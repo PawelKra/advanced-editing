@@ -54,7 +54,7 @@ pub fn split_with_line(ctx: &Ctx) -> Res<Value> {
     let mut spec = ToolSpec::new(SPLIT_USAGE, &[Dim::Line], &[Dim::Polygon, Dim::Line]);
     spec.target_properties = true;
     spec.whole_layer = ctx.settings.whole_layer;
-    let sel = selection::gather(&spec)?;
+    let mut sel = selection::gather(&spec)?;
     let read = budget::edit_fuel(
         sel.target_count(),
         budget::vertices(&sel.tools) + sel.targets.iter().map(|t| budget::vertices(&t.features)).sum::<usize>(),
@@ -116,7 +116,7 @@ pub fn split_with_line(ctx: &Ctx) -> Res<Value> {
         limit: SPLIT_WORK_FUEL,
         read_whole: sel.targets_from_active.then_some(sel.active.id),
     };
-    let shared = topo::plan(ctx.settings.topological, &scope, &new_vertices)?;
+    let shared = topo::plan(ctx.settings.topological, &scope, &new_vertices, &mut sel.read)?;
     // the placer has already unprojected; Edits only keeps the rows for the final selection
     let mut ed = Edits::new(VertexSnap::new(frame, SNAP_TOL_M));
     for (layer, f, g) in &writes {
@@ -302,7 +302,7 @@ const OFFSET_FUEL_PER_CHECK: u64 = 500;
 /// rectangular and comb-shaped rings of 250 to 2000 vertices, inwards and outwards by 1 to
 /// 20 m. It grows faster than the vertices, the more so the more of them lie within `d` of
 /// each other (inwards along a curve every shifted edge overlaps that many others).
-fn buffer_fuel(p: &Polygon<f64>, d: f64) -> u64 {
+pub(crate) fn buffer_fuel(p: &Polygon<f64>, d: f64) -> u64 {
     let rings = std::iter::once(p.exterior()).chain(p.interiors());
     let (v, len) = rings.fold((0usize, 0.0), |(v, len), r| (v + r.0.len(), len + Euclidean.length(r)));
     let near = if len > 0.0 { (2.0 * d.abs() * v as f64 / len).min(1e6) } else { 0.0 };
@@ -364,7 +364,7 @@ pub fn trim_extend(ctx: &Ctx) -> Res<Value> {
         // the tool would read the layer a second time
         spec.target_dims = &[];
     }
-    let sel = selection::gather(&spec)?;
+    let mut sel = selection::gather(&spec)?;
     let tool_vertices = budget::vertices(&sel.tools);
     let mut targets: Vec<(i64, Feature)> =
         sel.targets.iter().flat_map(|t| t.features.iter().map(|f| (t.layer.id, f.clone()))).collect();
@@ -387,9 +387,12 @@ pub fn trim_extend(ctx: &Ctx) -> Res<Value> {
             budget::count(layer.features),
             layer.name
         );
-        let Some((reach, bytes)) = host_io::all_features_within(layer, LAYER_READ_CAP, budget::MAX_READ_BYTES)? else {
+        // within what reading the tool left of the command's reads
+        let Some((reach, bytes)) =
+            host_io::all_features_within(layer, LAYER_READ_CAP, budget::MAX_READ_BYTES, &mut sel.read)?
+        else {
             // refused before parsing; this read says why
-            host_io::all_features_capped(layer, LAYER_READ_CAP, false)?;
+            host_io::all_features_capped_within(layer, LAYER_READ_CAP, false, &mut sel.read)?;
             return Err(too_much);
         };
         let read = budget::edit_fuel(0, tool_vertices) + bytes as u64 * budget::READ_FUEL_PER_BYTE;
@@ -699,11 +702,11 @@ const SPLIT_WORK_FUEL: u64 = crate::polygons::CUT_WORK_FUEL;
 /// pair of segments (or point and segment) compared exactly, which takes up to four `hypot`s:
 /// upper bounds fitted to `diag-bench` runs on dense zigzags close together, crossing dense
 /// lines and wavy lines of 500 to 2000 vertices.
-const SCAN_FUEL_PER_BOX: u64 = 250;
+pub(crate) const SCAN_FUEL_PER_BOX: u64 = 250;
 const SCAN_FUEL_PER_PAIR: u64 = 15_000;
 /// Fuel per vertex projected to search a whole layer (the projection part of
 /// [`budget::EDIT_FUEL_PER_VERTEX`]).
-const PROJECT_FUEL_PER_VERTEX: u64 = budget::EDIT_FUEL_PER_VERTEX - budget::BYTES_PER_VERTEX * budget::READ_FUEL_PER_BYTE;
+pub(crate) const PROJECT_FUEL_PER_VERTEX: u64 = budget::EDIT_FUEL_PER_VERTEX - budget::BYTES_PER_VERTEX * budget::READ_FUEL_PER_BYTE;
 
 const SCAN_TOO_MUCH: &str = "Comparing the line with the targets segment by segment is more than one command can do. \
      Select fewer targets, or simplify the line or the targets, and repeat the command for the rest.";

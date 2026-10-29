@@ -156,3 +156,142 @@ def test_implicit_target_away_from_the_tool_is_not_found():
             e = s.error_of('cut-with-polygon', {'keepTools': True})
             check("none of the polygons of 'amn' touch the selected tool features" in e, e)
             check(s.features('amn') == before, 'a refusal changed data')
+
+
+def dateline_parts():
+    """A: 0.001° by 1° across the antimeridian; B: 0.1° by 0.02° across it further north,
+    twice the area of A although its lon/lat box is the narrower one."""
+    a = ring(179.9995, -179.9995, LAT, LAT + 1)
+    b = ring(179.95, -179.95, LAT + 2, LAT + 2.02)
+    return a, b
+
+
+def test_parts_without_locators_keep_the_largest_across_the_antimeridian():
+    a, b = dateline_parts()
+    mp = {'type': 'MultiPolygon', 'coordinates': [[a], [b]]}
+    for command in ('delete-part', 'split-off-part'):
+        with Session(write_layer('amp', [feature(mp, name='m')])) as s:
+            s.activate('amp')
+            s.select('amp', [0])
+            r = s.plugin(command)
+            after = s.features('amp')
+        check(r.get('deleted', r.get('created')) == 1, (command, r))
+        kept = after[0]['geometry']
+        check(kept['type'] == 'Polygon' and set(positions(kept)) == set(map(tuple, b)), (command, kept))
+        if command == 'split-off-part':
+            check(len(after) == 2 and set(positions(after[1]['geometry'])) == set(map(tuple, a)), after)
+
+
+def test_parts_without_locators_keep_the_largest_when_no_frame_fits_the_feature():
+    # A: 1° by 1° across the antimeridian at the equator, about 12 400 km². B: 2° by 1° at
+    # 80°N, about 4 100 km² in its own frame; C: 10° by 1° at 85°N, beyond any frame, about
+    # 9 700 km² on the ellipsoid. In square degrees B and C would be the larger.
+    a = ring(179.5, -179.5, -0.5, 0.5)
+    for other in (ring(10.0, 12.0, 80.0, 81.0), ring(10.0, 20.0, 85.0, 86.0)):
+        mp = {'type': 'MultiPolygon', 'coordinates': [[other], [a]]}
+        for command in ('delete-part', 'split-off-part'):
+            with Session(write_layer('amp', [feature(mp, name='m')])) as s:
+                s.activate('amp')
+                s.select('amp', [0])
+                r = s.plugin(command)
+                after = s.features('amp')
+            check(r.get('deleted', r.get('created')) == 1, (command, r))
+            kept = after[0]['geometry']
+            check(kept['type'] == 'Polygon' and set(positions(kept)) == set(map(tuple, a)), (command, kept))
+            if command == 'split-off-part':
+                check(len(after) == 2 and set(positions(after[1]['geometry'])) == set(map(tuple, other)), after)
+
+
+def point_at(lon, lat):
+    return {'type': 'Point', 'coordinates': [lon, lat]}
+
+
+def test_part_locators_across_the_antimeridian():
+    # A across the antimeridian, C a plain part west of it; locators just east and just west
+    # of 180° pick A, one near 0° (inside A's lon/lat box, far from it) picks nothing
+    a, _ = dateline_parts()
+    c = ring(179.0, 179.1)
+    mp = {'type': 'MultiPolygon', 'coordinates': [[a], [c]]}
+    locs = write_layer('amloc', [feature(point_at(-179.9998, LAT + 0.5), k=1),
+                                 feature(point_at(179.9998, LAT + 0.5), k=2),
+                                 feature(point_at(0.0, LAT + 0.5), k=3)])
+    for command in ('delete-part', 'split-off-part'):
+        for row in (0, 1):
+            with Session(write_layer('amp', [feature(mp, name='m')]), locs) as s:
+                s.select('amloc', [row])
+                s.activate('amp')
+                s.select('amp', [0], add=True)
+                r = s.plugin(command)
+                after = s.features('amp')
+            check(r.get('deleted', r.get('created')) == 1, (command, row, r))
+            check(set(positions(after[0]['geometry'])) == set(map(tuple, c)), (command, row, after[0]))
+        with Session(write_layer('amp', [feature(mp, name='m')]), locs) as s:
+            before = s.features('amp')
+            s.select('amloc', [2])
+            s.activate('amp')
+            s.select('amp', [0], add=True)
+            e = s.error_of(command)
+            check('none of the parts of the 1 selected polygon(s) touch' in e, (command, e))
+            check(s.features('amp') == before, 'a refusal changed data')
+
+
+def test_hole_locators_across_the_antimeridian():
+    # a polygon from 179.5°E to 179.5°W with one hole across the antimeridian and one east of it
+    across_hole = list(reversed(ring(179.99, -179.99, LAT + 0.4, LAT + 0.6)))
+    east_hole = list(reversed(ring(179.6, 179.7, LAT + 0.4, LAT + 0.6)))
+    holed = {'type': 'Polygon', 'coordinates': [ring(179.5, -179.5, LAT, LAT + 1), across_hole, east_hole]}
+    locs = write_layer('amloc', [feature(point_at(-179.995, LAT + 0.5), k=1),
+                                 feature(point_at(179.995, LAT + 0.5), k=2),
+                                 feature(point_at(0.0, LAT + 0.5), k=3)])
+    for row in (0, 1):
+        with Session(write_layer('amh', [feature(holed, name='h')]), locs) as s:
+            s.select('amloc', [row])
+            s.activate('amh')
+            s.select('amh', [0], add=True)
+            r = s.plugin('delete-ring')
+            g = s.features('amh')[0]['geometry']
+        check(r['rings'] == 1, (row, r))
+        check(len(g['coordinates']) == 2 and set(positions({'type': 'LineString', 'coordinates': g['coordinates'][1]}))
+              == set(map(tuple, east_hole)), (row, g))
+        with Session(write_layer('amh', [feature(holed, name='h')]), locs) as s:
+            s.select('amloc', [row])
+            s.activate('amh')
+            s.select('amh', [0], add=True)
+            r = s.plugin('fill-ring')
+            after = s.features('amh')
+        check(r['created'] == 1 and len(after) == 2, (row, r))
+        want = area_ell(unwrapped({'type': 'Polygon', 'coordinates': [across_hole]}))
+        got = area_ell(unwrapped(after[1]['geometry']))
+        check(abs(got - want) <= 1e-6 * want, 'fill %.1f m², hole %.1f m²' % (got, want))
+    for command in ('delete-ring', 'fill-ring'):
+        with Session(write_layer('amh', [feature(holed, name='h')]), locs) as s:
+            before = s.features('amh')
+            s.select('amloc', [2])
+            s.activate('amh')
+            s.select('amh', [0], add=True)
+            e = s.error_of(command)
+            check('none of the holes of the 1 selected polygon(s) touch' in e, (command, e))
+            check(s.features('amh') == before, 'a refusal changed data')
+
+
+def test_fill_ring_islands_across_the_antimeridian():
+    # a hole across the antimeridian with an island west of 180°, in a layer that also holds
+    # 10 polygons near 0° with 28 000 vertices: taken raw, the hole's box spans the world and
+    # each of them would be projected and measured as an island, more than the command can do
+    from test_limits import blob
+    across_hole = list(reversed(ring(179.99, -179.99, LAT + 0.4, LAT + 0.6)))
+    holed = {'type': 'Polygon', 'coordinates': [ring(179.5, -179.5, LAT, LAT + 1), across_hole]}
+    island = {'type': 'Polygon', 'coordinates': [ring(-179.998, -179.992, LAT + 0.45, LAT + 0.55)]}
+    far = [feature({'type': 'Polygon', 'coordinates': [blob(300 * i, 0, 100, 2800, (0.5, LAT + 0.5))]}, name='far')
+           for i in range(10)]
+    with Session(write_layer('amh', [feature(holed, name='h'), feature(island, name='i')] + far)) as s:
+        s.activate('amh')
+        s.select('amh', [0])
+        r = s.plugin('fill-ring')
+        after = s.features('amh')
+    check(r['created'] == 1 and r['islands'] == 1 and r['layerChecked'], r)
+    want = area_ell(unwrapped({'type': 'Polygon', 'coordinates': [across_hole]})) - area_ell(unwrapped(island))
+    got = area_ell(unwrapped(after[-1]['geometry']))
+    check(abs(got - want) <= 1e-6 * want, 'fill %.1f m², hole less the island %.1f m²' % (got, want))
+    lons = [p[0] for p in positions(after[-1]['geometry'])]
+    check(all(-180.0 <= x <= 180.0 for x in lons), 'longitudes outside [-180, 180]')

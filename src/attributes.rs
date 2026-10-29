@@ -10,13 +10,14 @@ use std::hash::BuildHasherDefault;
 
 use geo::{
     Area, ChaikinSmoothing, Coord, Densify, Euclidean, Length, LineString, MultiLineString, MultiPoint,
-    MultiPolygon, Polygon, Simplify, unary_union,
+    MultiPolygon, Polygon, Simplify,
 };
 use rustgis_plugin::{Map, Value, json};
 
 use crate::Ctx;
 use crate::geojson::{self, COORD_EPS_DEG, Dim, Geom, same_coord};
 use crate::host_io::{self, Res, budget};
+use crate::polygons;
 use crate::proj::{SNAP_TOL_M, VertexSnap};
 use crate::selection::{EditSpec, active_features};
 use crate::topo::KeyHasher;
@@ -407,8 +408,9 @@ fn is_numeric_kind(kind: &str) -> bool {
 }
 
 /// The sum of a numeric field's values, `None` when all are null (nulls count as 0 next to a
-/// value). An integer field's sum stays an integer unless it overflows.
-fn sum_values<'a>(values: impl Iterator<Item = &'a Value>, integer: bool) -> Option<Value> {
+/// value). An integer field's sum stays an integer unless it overflows. A total beyond the
+/// range of a double is an error: JSON has no infinity, so it would be written as null.
+fn sum_values<'a>(values: impl Iterator<Item = &'a Value>, integer: bool, field: &str) -> Res<Option<Value>> {
     let (mut int, mut float, mut all_int, mut any) = (Some(0i64), 0.0f64, integer, false);
     for v in values {
         let Some(x) = v.as_f64() else { continue };
@@ -419,10 +421,14 @@ fn sum_values<'a>(values: impl Iterator<Item = &'a Value>, integer: bool) -> Opt
             _ => all_int = false,
         }
     }
-    any.then(|| match int.filter(|_| all_int) {
-        Some(i) => json!(i),
-        None => json!(float),
-    })
+    if !any {
+        return Ok(None);
+    }
+    match int.filter(|_| all_int) {
+        Some(i) => Ok(Some(json!(i))),
+        None if float.is_finite() => Ok(Some(json!(float))),
+        None => Err(format!("the sum of field \"{field}\" is out of range for a number")),
+    }
 }
 
 /// Merges the selected features of the active layer into one. There is no dialog, so the
@@ -466,10 +472,20 @@ pub fn merge_with_attributes(ctx: &Ctx) -> Res<Value> {
         Dim::Polygon => {
             let polys: Vec<Polygon<f64>> =
                 metric.iter().filter_map(Geom::to_multi_polygon).flat_map(|m| m.0).collect();
-            let u = unary_union(polys.iter());
+            // everything is computed before the first write, so a refusal changes nothing
+            let vertices = budget::vertices(&ed.features);
+            let read = budget::edit_fuel(ed.features.len(), vertices);
+            let mut fuel = budget::Meter::new(
+                polygons::CUT_WORK_FUEL.saturating_sub(read),
+                "Merging these polygons is more than one command can do. Select fewer polygons, or simplify \
+                 them, and merge them in steps.",
+            );
+            let u = polygons::metered_union(&polys, &mut fuel)?;
             if u.0.is_empty() {
                 return Err("the merged polygon is empty".into());
             }
+            // the vertices the polygons had are written as part of editing them
+            fuel.spend(budget::write_fuel(0, geo::CoordsIter::coords_count(&u).saturating_sub(vertices)))?;
             snap.unproject(&Geom::MultiPolygon(u))
         }
         Dim::Line => {
@@ -504,7 +520,8 @@ pub fn merge_with_attributes(ctx: &Ctx) -> Res<Value> {
             let total = sum_values(
                 ed.features.iter().filter_map(|f| f.properties.get(&field.name)),
                 field.kind.to_ascii_lowercase().contains("int"),
-            );
+                &field.name,
+            )?;
             if let Some(total) = total
                 && kept.properties.get(&field.name) != Some(&total)
             {
@@ -669,13 +686,14 @@ struct Tally {
     unchanged: usize,
     collapsed: Vec<i64>,
     invalid: Vec<i64>,
+    was_invalid: Vec<i64>,
     before: usize,
     after: usize,
 }
 
 /// Runs `op` (see [`rework`]) on every selected line or polygon of the active layer, in
 /// metres, and writes back the features it changed. A feature that would collapse or turn
-/// invalid is left as it is and reported.
+/// out invalid (whether or not it was valid before) is left as it is and reported.
 fn generalize(
     usage: &'static str,
     ctx: &Ctx,
@@ -689,14 +707,27 @@ fn generalize(
     let frame = ed.frame()?;
     let mut snap = VertexSnap::new(frame, SNAP_TOL_M);
     let metric: Vec<Geom> = ed.features.iter().map(|f| f.geom().map(|g| snap.project(g))).collect::<Res<_>>()?;
+    let mut written = 0;
     if let Some(estimate) = vertex_factor {
         // Summed in f64: a tiny script distance gives counts far beyond usize, and a
         // saturated or wrapped integer would slip past the budget.
         let total: f64 = metric.iter().map(estimate).sum();
         let total = if total < MAX_ESTIMATE { total.ceil() as usize } else { MAX_ESTIMATE as usize };
         budget::check_write(metric.len(), total)?;
+        written = total;
     }
+    // the validity checks get what reading, editing and the new vertices leave; every result
+    // is checked before the first write, so a refusal changes nothing
+    let vertices = budget::vertices(&ed.features);
+    let mut fuel = budget::Meter::new(
+        polygons::CUT_WORK_FUEL
+            .saturating_sub(budget::edit_fuel(ed.features.len(), vertices))
+            .saturating_sub(budget::write_fuel(0, written.saturating_sub(vertices))),
+        "Checking the results for crossing rings is more than one command can do: these polygons have \
+         too many rings or segments side by side. Select fewer features and repeat the command for the rest.",
+    );
     let mut t = Tally::default();
+    let mut writes = Vec::new();
     for (f, m) in ed.features.iter().zip(&metric) {
         let orig = f.geom()?;
         t.before += orig.num_coords();
@@ -711,13 +742,17 @@ fn generalize(
             t.unchanged += 1;
             continue;
         }
-        if check_topology && out_m.dim() == Dim::Polygon && !rings_simple(&out_m) && rings_simple(m) {
-            t.invalid.push(f.id);
+        // an invalid result is never written, also when the input was already invalid
+        if check_topology && out_m.dim() == Dim::Polygon && !rings_simple(&out_m, &mut fuel)? {
+            if rings_simple(m, &mut fuel)? { t.invalid.push(f.id) } else { t.was_invalid.push(f.id) }
             continue;
         }
         t.after = t.after - orig.num_coords() + out.num_coords();
-        host_io::set_geometry(ed.layer.id, f.row, &out)?;
-        t.changed.push(f.row);
+        writes.push((f.row, out));
+    }
+    for (row, out) in &writes {
+        host_io::set_geometry(ed.layer.id, *row, out)?;
+        t.changed.push(*row);
     }
     if !t.changed.is_empty() {
         host_io::set_selection(&[(ed.layer.id, t.changed.to_vec())])?;
@@ -745,6 +780,17 @@ fn segments_cross(a: Coord<f64>, b: Coord<f64>, c: Coord<f64>, d: Coord<f64>) ->
     false
 }
 
+/// Segments ab and cd have any point in common, an end point included.
+fn segments_meet(a: Coord<f64>, b: Coord<f64>, c: Coord<f64>, d: Coord<f64>) -> bool {
+    let (o1, o2, o3, o4) = (orient(a, b, c), orient(a, b, d), orient(c, d, a), orient(c, d, b));
+    if o1 == 0.0 && o2 == 0.0 {
+        let along_x = (b.x - a.x).abs() >= (b.y - a.y).abs();
+        let u = |p: Coord<f64>| if along_x { p.x } else { p.y };
+        return u(a).min(u(b)).max(u(c).min(u(d))) <= u(a).max(u(b)).min(u(c).max(u(d)));
+    }
+    o1 * o2 <= 0.0 && o3 * o4 <= 0.0
+}
+
 /// Whether `p` lies inside ring `r`; `None` when it lies on the ring.
 fn ring_side(p: Coord<f64>, r: &LineString<f64>) -> Option<bool> {
     let mut inside = false;
@@ -766,15 +812,32 @@ fn ring_side(p: Coord<f64>, r: &LineString<f64>) -> Option<bool> {
 }
 
 /// Whether ring `a` lies inside ring `b`, for rings that do not cross: decided by the first
-/// vertex or segment midpoint of `a` that is not on `b`, since vertices may touch.
-fn ring_inside(a: &LineString<f64>, b: &LineString<f64>) -> bool {
-    a.0.windows(2)
-        .find_map(|w| {
-            let mid = Coord { x: (w[0].x + w[1].x) / 2.0, y: (w[0].y + w[1].y) / 2.0 };
-            ring_side(w[0], b).or_else(|| ring_side(mid, b))
-        })
-        .unwrap_or(false)
+/// vertex or segment midpoint of `a` that is not on `b`, since vertices may touch. Each
+/// point tested is charged for the segments of `b`.
+fn ring_inside(a: &LineString<f64>, b: &LineString<f64>, fuel: &mut budget::Meter) -> Res<bool> {
+    let side = |p: Coord<f64>, fuel: &mut budget::Meter| {
+        fuel.spend(b.0.len() as u64 * RING_FUEL_PER_SIDE_SEGMENT)?;
+        Ok::<_, String>(ring_side(p, b))
+    };
+    for w in a.0.windows(2) {
+        let mid = Coord { x: (w[0].x + w[1].x) / 2.0, y: (w[0].y + w[1].y) / 2.0 };
+        if let Some(inside) = side(w[0], fuel)? {
+            return Ok(inside);
+        }
+        if let Some(inside) = side(mid, fuel)? {
+            return Ok(inside);
+        }
+    }
+    Ok(false)
 }
+
+/// Fuel [`rings_simple`] charges per segment (collecting and sorting it), per pair of segments
+/// or ring boxes it compares, and per segment of a ring a point is tested against: measured
+/// on stacked holes, holes in a grid and plain rings of 3 000 to 20 000 vertices, with 15-35 %
+/// to spare.
+const RING_FUEL_PER_SEGMENT: u64 = 2_000;
+const RING_FUEL_PER_PAIR: u64 = 600;
+const RING_FUEL_PER_SIDE_SEGMENT: u64 = 220;
 
 /// (min x, min y, max x, max y) of a ring.
 fn ring_box(r: &LineString<f64>) -> [f64; 4] {
@@ -788,13 +851,18 @@ fn box_within(a: &[f64; 4], b: &[f64; 4]) -> bool {
 }
 
 /// A cheap stand-in for OGC validity, linear-ish where `geo::Validation` is quadratic and
-/// too slow for a selection: no two segments of any rings cross (touching at a vertex is
-/// allowed), every hole lies inside its own outer ring and outside its other holes, and an
-/// outer ring lies inside another part only within one of its holes. This catches what
+/// too slow for a selection: no two segments of any rings cross (different rings may touch
+/// at a vertex; a ring may not touch itself, as a self-touching ring is not simple), every
+/// hole lies inside its own outer ring and outside its other holes, and an outer ring lies
+/// inside another part only within one of its holes. This catches what
 /// simplifying or smoothing rings independently can break. Containment is only tested
 /// between rings whose boxes nest, found by a sweep like the segments'.
-fn rings_simple(g: &Geom) -> bool {
-    let Some(mp) = g.to_multi_polygon() else { return true };
+///
+/// A sweep on x alone compares every pair of segments whose x-ranges overlap, quadratic for
+/// rings stacked one above another, so the pairs are counted and charged to `fuel` before
+/// any is compared, and the containment tests as they go.
+fn rings_simple(g: &Geom, fuel: &mut budget::Meter) -> Res<bool> {
+    let Some(mp) = g.to_multi_polygon() else { return Ok(true) };
     // (min x, max x, a, b, ring, index, segments in ring)
     let mut segs = Vec::new();
     // per polygon, the boxes of its outer ring and holes
@@ -803,8 +871,11 @@ fn rings_simple(g: &Geom) -> bool {
     for p in &mp.0 {
         let mut pb = Vec::with_capacity(p.interiors().len() + 1);
         for r in std::iter::once(p.exterior()).chain(p.interiors()) {
-            let n = r.0.len().saturating_sub(1);
-            for (i, w) in r.0.windows(2).enumerate() {
+            // repeated vertices are skipped, so segments that meet across one count as adjacent
+            let mut pts = r.0.clone();
+            pts.dedup();
+            let n = pts.len().saturating_sub(1);
+            for (i, w) in pts.windows(2).enumerate() {
                 segs.push((w[0].x.min(w[1].x), w[0].x.max(w[1].x), w[0], w[1], ring_no, i, n));
             }
             pb.push(ring_box(r));
@@ -812,7 +883,11 @@ fn rings_simple(g: &Geom) -> bool {
         }
         boxes.push(pb);
     }
+    fuel.spend(segs.len() as u64 * RING_FUEL_PER_SEGMENT)?;
     segs.sort_by(|a, b| a.0.total_cmp(&b.0));
+    // the segments after `s` that start within its x-range follow it in one run
+    let pairs: u64 = segs.iter().enumerate().map(|(i, s)| segs[i + 1..].partition_point(|t| t.0 <= s.1) as u64).sum();
+    fuel.spend(pairs.saturating_mul(RING_FUEL_PER_PAIR))?;
     for (i, s) in segs.iter().enumerate() {
         for t in &segs[i + 1..] {
             if t.0 > s.1 {
@@ -823,9 +898,12 @@ fn rings_simple(g: &Geom) -> bool {
                 if d == 1 || d + 1 == s.6 {
                     continue;
                 }
+                if segments_meet(s.2, s.3, t.2, t.3) {
+                    return Ok(false);
+                }
             }
             if segments_cross(s.2, s.3, t.2, t.3) {
-                return false;
+                return Ok(false);
             }
         }
     }
@@ -833,42 +911,56 @@ fn rings_simple(g: &Geom) -> bool {
     let ring = |p: usize, k: usize| if k == 0 { mp.0[p].exterior() } else { &mp.0[p].interiors()[k - 1] };
     for (p, pb) in boxes.iter().enumerate() {
         for k in 1..pb.len() {
-            if !box_within(&pb[k], &pb[0]) || !ring_inside(ring(p, k), ring(p, 0)) {
-                return false;
+            if !box_within(&pb[k], &pb[0]) || !ring_inside(ring(p, k), ring(p, 0), fuel)? {
+                return Ok(false);
             }
         }
     }
     // `a` lying inside `b` breaks validity when both are outer rings (unless `a` sits in one of
     // `b`'s holes) or both are holes of one polygon; other nestings follow from these.
-    let bad_nesting = |(ap, ak): (usize, usize), (bp, bk): (usize, usize)| {
+    let bad_nesting = |(ap, ak): (usize, usize), (bp, bk): (usize, usize), fuel: &mut budget::Meter| -> Res<bool> {
         let ab = &boxes[ap][ak];
         if !box_within(ab, &boxes[bp][bk]) {
-            return false;
+            return Ok(false);
         }
         let ra = ring(ap, ak);
         match (ak, bk) {
             (0, 0) => {
-                ring_inside(ra, ring(bp, 0))
-                    && !(1..boxes[bp].len()).any(|h| box_within(ab, &boxes[bp][h]) && ring_inside(ra, ring(bp, h)))
+                if !ring_inside(ra, ring(bp, 0), fuel)? {
+                    return Ok(false);
+                }
+                fuel.spend(boxes[bp].len() as u64 * RING_FUEL_PER_PAIR)?;
+                for h in 1..boxes[bp].len() {
+                    if box_within(ab, &boxes[bp][h]) && ring_inside(ra, ring(bp, h), fuel)? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
             }
-            (0, _) | (_, 0) => false,
-            _ => ap == bp && ring_inside(ra, ring(bp, bk)),
+            (0, _) | (_, 0) => Ok(false),
+            _ => Ok(ap == bp && ring_inside(ra, ring(bp, bk), fuel)?),
         }
     };
     let mut order: Vec<(usize, usize)> =
         boxes.iter().enumerate().flat_map(|(p, pb)| (0..pb.len()).map(move |k| (p, k))).collect();
     order.sort_by(|a, b| boxes[a.0][a.1][0].total_cmp(&boxes[b.0][b.1][0]));
+    let pairs: u64 = order
+        .iter()
+        .enumerate()
+        .map(|(i, a)| order[i + 1..].partition_point(|b| boxes[b.0][b.1][0] <= boxes[a.0][a.1][2]) as u64)
+        .sum();
+    fuel.spend(pairs.saturating_mul(RING_FUEL_PER_PAIR))?;
     for (i, &a) in order.iter().enumerate() {
         for &b in &order[i + 1..] {
             if boxes[b.0][b.1][0] > boxes[a.0][a.1][2] {
                 break;
             }
-            if bad_nesting(a, b) || bad_nesting(b, a) {
-                return false;
+            if bad_nesting(a, b, fuel)? || bad_nesting(b, a, fuel)? {
+                return Ok(false);
             }
         }
     }
-    true
+    Ok(true)
 }
 
 fn ids(v: &[i64]) -> String {
@@ -891,6 +983,9 @@ fn report(ctx: &Ctx, verb: &str, setting: &str, t: &Tally, dim: Dim, note_shared
     if !t.invalid.is_empty() {
         msg += &format!(" Left unchanged, would become invalid: {}.", ids(&t.invalid));
     }
+    if !t.was_invalid.is_empty() {
+        msg += &format!(" Left unchanged, already invalid (and still invalid after the change): {}.", ids(&t.was_invalid));
+    }
     if note_shared && dim == Dim::Polygon && !t.changed.is_empty() {
         msg += " ";
         msg += SHARED_BOUNDARY_NOTE;
@@ -902,6 +997,7 @@ fn report(ctx: &Ctx, verb: &str, setting: &str, t: &Tally, dim: Dim, note_shared
             "unchanged": t.unchanged,
             "collapsed": t.collapsed.len(),
             "invalid": t.invalid.len(),
+            "alreadyInvalid": t.was_invalid.len(),
             "verticesBefore": t.before,
             "verticesAfter": t.after,
         }),

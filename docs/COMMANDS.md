@@ -21,7 +21,7 @@ Every command of the **Advanced Editing** ribbon tab and the **Divide Parcel** t
 - **Active layer**: the layer selected in the Layers pane.
 - **Tool features**: the selected features of the active layer (a cutter, a splitting line, a boundary).
 - **Target features**: the features a tool command edits. They are the selected features of the **other** vector layers; when no other layer has a selection, or with **Use whole active layer as targets** (`wholeLayer`), they are the features of the active layer that intersect a tool feature, the tools themselves excluded.
-- **Locators**: for Delete Ring, Fill Ring, Delete Part and Split Off Part, the features selected in other vector layers (points, lines or polygons). They limit the command to the holes or parts they intersect; without locators the command acts on all of them. When the selected features elsewhere all lack a geometry, the command is refused (*The selected features in 'loc' have no geometry to pick holes with; select features with a geometry or clear that selection*) rather than acting on all of them.
+- **Locators**: for Delete Ring, Fill Ring, Delete Part and Split Off Part, the features selected in other vector layers (points, lines or polygons). They limit the command to the holes or parts they intersect (across the antimeridian too: a locator at 179.95°W picks a part from 179.9°E to 179.9°W); without locators the command acts on all of them. When the selected features elsewhere all lack a geometry, the command is refused (*The selected features in 'loc' have no geometry to pick holes with; select features with a geometry or clear that selection*) rather than acting on all of them.
 - **Working frame**: all geometry work happens in metres, in EPSG:2180 when every input position lies in Poland (14.0–24.2°E, 49.0–54.9°N), otherwise in the WGS 84 UTM zone of the centre of the input's extent. Distances, areas and bearings below are in this frame unless stated otherwise ("ellipsoidal" areas are on GRS80).
 - **Bit-exact vertices**: every vertex a command writes back within 0.01 mm of an input vertex gets that vertex's original coordinates. This holds for every command below and is not repeated.
 - **Result selection**: after a successful command, the changed and new features are selected.
@@ -80,13 +80,13 @@ The reasons the selection model gives, for every command:
 
 Budget refusals (see [Limits](../README.md#limits)):
 
-- *Reading the 35 features of 'blobs' means 1.4 MB of data; one command reads about 1.2 MB. Select fewer features.*
+- *Reading the 35 features of 'blobs' means 1.4 MB of data; one command reads about 1.2 MB. Select fewer features.* The limit holds for all the layers a command reads together (tools, targets, locators, and a layer Trim/Extend searches whole): *Reading the 10 selected features of 'f1' means 0.5 MB of data on top of the 0.9 MB already read; one command reads about 1.2 MB. Select fewer features.*
 - *This would edit 812 features with 61 000 vertices; one command handles about 20 000 vertices. Select fewer features and repeat the command for the rest.*
 - *The result would be … features with about … vertices; one command writes about 41 000 vertices. Select fewer features or use a coarser setting, and repeat the command for the rest.*
 
 Frame refusals: *the features span 30.0° of longitude; metric editing needs them within 20°*, *features beyond ±84° latitude are not supported*. Longitude is measured the short way round, so features across the antimeridian (179.9° to -179.9°) span 0.2°; new vertices come back within -180° to 180°.
 
-**Topological editing note.** Commands that place new vertices on original edges (Cut, Clip, Split With Line, the division commands) append to their message *; added N shared vertices to M neighbouring feature(s)* and, for a layer too large to read, search or update within the command's budget (it is then left unchanged), *; shared vertices not added in '…': the layer is too large to search in the same command (select fewer features or turn off Topological editing)*. In a message that is a sentence, the note goes before the full stop.
+**Topological editing note.** Commands that place new vertices on original edges (Cut, Clip, Split With Line, the division commands) append to their message *; added N shared vertices to M neighbouring feature(s)* and, for a layer too large to read, search or update within the command's budget and what is left of its reads (it is then left unchanged), *; shared vertices not added in '…': the layer is too large to search in the same command (select fewer features or turn off Topological editing)*. In a message that is a sentence, the note goes before the full stop.
 
 ---
 
@@ -155,7 +155,7 @@ rustgis-cli run --plugin advanced-editing-0.1.1.rgplugin --data parcels.gpkg --d
 
 **Message.** *Added 2 hole(s) to 1 polygon(s); skipped 1 tool polygon(s): 1 not inside a target, 0 crossing, overlapping or running along its outline or holes*
 
-**Refusal.** *Select the polygon(s) to make holes of in the active layer and the polygons around them in another layer. (no tool polygon lies inside a target: 1 outside, 0 crossing, overlapping or running along a target's outline or holes)*
+**Refusal.** *Select the polygon(s) to make holes of in the active layer and the polygons around them in another layer. (no tool polygon lies inside a target: 1 outside, 0 crossing, overlapping or running along a target's outline or holes)* Budget, before any change (every tool is tried in every target part its box meets, with up to two boolean ops): *Trying these polygons as holes in the targets is more than one command can do. Select fewer tool polygons or targets, or simplify them, and repeat the command for the rest.* (for example 1000 tools in the box of 1000 targets, inside none)
 
 ```sh
 rustgis-cli run --plugin advanced-editing-0.1.1.rgplugin --data parcels.gpkg --data holes.geojson \
@@ -199,7 +199,7 @@ rustgis-cli run --plugin advanced-editing-0.1.1.rgplugin --data parcels.gpkg \
 | Created | One polygon per filled hole. |
 | Attributes | The new polygon copies the attributes of the polygon around the hole, except `id`, `fid` and `ogc_fid`. |
 
-**Islands.** Polygons lying inside the hole stay out of the new polygon: other parts of the same feature and other polygons of the active layer (read whole when it fits the command's budget). When the layer is too large to read, only the selected polygons are checked: an unselected polygon lying in the hole is then not left out and the new polygon overlaps it; the message says so. Select such polygons too (they are then left out), or undo. An island's own holes are not part of the island: each hole the command fills is filled once, so an island's hole that gets its own fill (a hole of a selected polygon, picked by the locators if any) stays out of the fill around the island, and any other hole of an island (an unselected polygon's, or one the locators did not pick) is filled as part of the hole around it. An island touching the hole's ring is joined to it exactly (its vertex is inserted into the ring). A hole that islands cover entirely is not filled.
+**Islands.** Polygons lying inside the hole stay out of the new polygon: other parts of the same feature and other polygons of the active layer (read whole when it fits the command's budget and what is left of its reads after the selected polygons and the locators). When the layer is too large to read, only the selected polygons are checked: an unselected polygon lying in the hole is then not left out and the new polygon overlaps it; the message says so. Select such polygons too (they are then left out), or undo. An island's own holes are not part of the island: each hole the command fills is filled once, so an island's hole that gets its own fill (a hole of a selected polygon, picked by the locators if any) stays out of the fill around the island, and any other hole of an island (an unselected polygon's, or one the locators did not pick) is filled as part of the hole around it. An island touching the hole's ring is joined to it exactly (its vertex is inserted into the ring). A hole that islands cover entirely is not filled.
 
 ![Left: a square polygon with a square hole and a smaller island polygon inside the hole. Right: a new polygon fills the hole around the island](images/fill-ring.png)
 
@@ -207,7 +207,7 @@ rustgis-cli run --plugin advanced-editing-0.1.1.rgplugin --data parcels.gpkg \
 
 **Message.** *Filled 1 hole(s) with new polygons; 1 island(s) left out of them*, and, when the layer is too large to search, *; the layer is too large to check its unselected polygons for islands: the new polygon may overlap unselected polygons of '…' lying in the hole. Select those polygons too, or undo*.
 
-**Refusals.** *Select the polygons whose holes to fill in the active layer (optionally points or polygons in another layer to pick the holes). (the 1 selected polygon(s) have no holes)*; *(islands cover each of the 1 hole(s) entirely)*.
+**Refusals.** *Select the polygons whose holes to fill in the active layer (optionally points or polygons in another layer to pick the holes). (the 1 selected polygon(s) have no holes)*; *(islands cover each of the 1 hole(s) entirely)*. Budget, before any change (the boolean ops with the islands and the new polygons' writes): *Filling these holes around the islands in them is more than one command can do. Select fewer polygons, or simplify them, and repeat the command for the rest.*
 
 ```sh
 rustgis-cli run --plugin advanced-editing-0.1.1.rgplugin --data parcels.gpkg \
@@ -232,7 +232,7 @@ rustgis-cli run --plugin advanced-editing-0.1.1.rgplugin --data parcels.gpkg \
 
 **Message.** *Added 1 polygon(s) to the feature, which now has 2 part(s)*, with *(overlapping or touching parts were merged)* when the part count dropped.
 
-**Refusal.** *Select the polygon(s) to add as parts in the active layer and the one polygon to add them to in another layer. (2 target polygons, the parts go to exactly one)*
+**Refusal.** *Select the polygon(s) to add as parts in the active layer and the one polygon to add them to in another layer. (2 target polygons, the parts go to exactly one)* Budget, before any change, when parts overlap or touch: *Merging these polygons with the target's parts is more than one command can do. Select fewer polygons, or simplify them, and repeat the command for the rest.*
 
 ```sh
 rustgis-cli run --plugin advanced-editing-0.1.1.rgplugin --data parcels.gpkg --data parts.geojson \
@@ -253,7 +253,7 @@ rustgis-cli run --plugin advanced-editing-0.1.1.rgplugin --data parcels.gpkg --d
 | Settings | none |
 | Changed | Polygons that lose parts. |
 
-**Behaviour.** The last part is never deleted: a feature whose every part a locator picks is skipped (delete the feature instead). The largest part is ranked by area within the feature.
+**Behaviour.** The last part is never deleted: a feature whose every part a locator picks is skipped (delete the feature instead). The largest part is ranked by area within the feature, measured in the feature's working frame (a part across the antimeridian by its true size); in a feature too large for a frame each part is measured in its own frame, and a part too large for one (or beyond ±84°) on the ellipsoid (an equal-area approximation within about 1 %).
 
 **Message.** *Deleted 2 part(s) of 1 polygon(s); skipped 1 feature(s) whose every part was picked*
 
@@ -299,7 +299,7 @@ rustgis-cli run --plugin advanced-editing-0.1.1.rgplugin --data parcels.gpkg \
 
 **Message.** *Filled 1 gap(s) with new polygons (2 sliver(s) under 0.01 m² or 0.01 m wide ignored)*
 
-**Refusal.** *Select the polygons around the gaps in the active layer. (no enclosed gap between the 4 polygons; gaps open to the outside are not filled, 1 sliver(s) ignored)*
+**Refusal.** *Select the polygons around the gaps in the active layer. (no enclosed gap between the 4 polygons; gaps open to the outside are not filled, 1 sliver(s) ignored)* Budget, before any change (the union, the boolean ops and openings of the gaps and the new polygons' writes): *Finding the gaps between these polygons is more than one command can do. Select fewer polygons, or simplify them, and repeat the command for the rest.* (for example a comb of 1500 teeth, whose edges side by side the union compares in pairs, or 70 thin bars across 70 others, whose crossings it resolves)
 
 ```sh
 rustgis-cli run --plugin advanced-editing-0.1.1.rgplugin --data parcels.gpkg \
@@ -463,11 +463,11 @@ rustgis-cli run --plugin advanced-editing-0.1.1.rgplugin --data lines.gpkg --dat
 
 **Geometry.** Polygons are unioned. Lines that run over each other are dissolved, so a shared stretch is kept once (within 0.1 mm), then joined where exactly two of their ends meet (as GEOS's line merge); where three or more ends meet, the lines stay apart. Points become a MultiPoint.
 
-**Summing.** With `sum`, each numeric field (integer, real, double, float, decimal, numeric) except `id`, `fid` and `ogc_fid` gets the sum over the merged features. Nulls count as 0 next to at least one value; a field null in all of them stays null; an integer field's sum stays an integer unless it overflows.
+**Summing.** With `sum`, each numeric field (integer, real, double, float, decimal, numeric) except `id`, `fid` and `ogc_fid` gets the sum over the merged features. Nulls count as 0 next to at least one value; a field null in all of them stays null; an integer field's sum stays an integer unless it overflows. A sum beyond the range of a double (about ±1.8e308) refuses the merge, naming the field, and nothing is changed: it could only be stored as null.
 
 **Message.** *Merged 2 features into feature 4, which keeps its attributes (the longest). Summed 1 numeric field.*
 
-**Refusals.** *Select two or more features of the active layer to merge. (1 line feature(s) to work on in the active layer '…')*; *(feature 7 is not a polygon like the layer '…')*; *Merging these 3 000 lines means comparing 4 498 500 pairs of segments, and is more than one command can do. Select fewer lines and merge them in steps.* (see [Limits](../README.md#limits)).
+**Refusals.** *Select two or more features of the active layer to merge. (1 line feature(s) to work on in the active layer '…')*; *(feature 7 is not a polygon like the layer '…')*; *Merging these 3 000 lines means comparing 4 498 500 pairs of segments, and is more than one command can do. Select fewer lines and merge them in steps.*; for polygons, before any change: *Merging these polygons is more than one command can do. Select fewer polygons, or simplify them, and merge them in steps.* (for example a comb of 1500 teeth, or 70 thin bars across 70 others, whose union resolves every crossing; see [Limits](../README.md#limits)). *the sum of field "w" is out of range for a number*.
 
 ```sh
 rustgis-cli run --plugin advanced-editing-0.1.1.rgplugin --data roads.gpkg \
@@ -529,7 +529,9 @@ rustgis-cli run --plugin advanced-editing-0.1.1.rgplugin --data parcels.gpkg \
 | Settings | `tolerance` (m), `wholeLayer` |
 | Changed | Features whose geometry changes. |
 
-**Behaviour.** Vertices closer than Tolerance to the simplified shape are removed. Holes and parts that collapse are dropped; a feature that would collapse entirely, or a polygon whose rings would start crossing or whose parts or holes would end up inside one another, is left unchanged and listed. Each feature is simplified on its own, so boundaries shared with neighbours can open gaps or overlaps; the message warns about it for polygons.
+**Behaviour.** Vertices closer than Tolerance to the simplified shape are removed. Holes and parts that collapse are dropped; a feature that would collapse entirely, or a polygon whose rings would start crossing or touching themselves or whose parts or holes would end up inside one another, is left unchanged and listed. A polygon that is already invalid that way is changed only if the result is valid; otherwise it is left unchanged and listed as already invalid. A ring may touch another ring at a point, but not itself. Each feature is simplified on its own, so boundaries shared with neighbours can open gaps or overlaps; the message warns about it for polygons.
+
+**Refusal.** Budget, before any change (checking every result for crossing rings, which compares the segments lying side by side across x): *Checking the results for crossing rings is more than one command can do: these polygons have too many rings or segments side by side. Select fewer features and repeat the command for the rest.* (for example a polygon with 3000 narrow holes stacked one above another; also Smooth)
 
 **Message.** *Simplified 3 features (tolerance 0.5 m; 412 → 160 vertices). 1 feature needed no change. Left unchanged, would collapse: 17. Each feature was edited on its own: boundaries shared with neighbours can now leave gaps or overlaps.*
 
@@ -571,7 +573,7 @@ rustgis-cli run --plugin advanced-editing-0.1.1.rgplugin --data roads.gpkg \
 | Settings | `iterations` (panel 1–5, script 1–10), `wholeLayer` |
 | Changed | Each smoothed feature. |
 
-Each pass roughly doubles the vertices. Line ends stay in place; polygon rings stay closed. A polygon whose rings would start crossing or whose parts or holes would end up inside one another is left unchanged and listed. As with Simplify, shared boundaries can open gaps or overlaps, and the message says so.
+Each pass roughly doubles the vertices. Line ends stay in place; polygon rings stay closed. A polygon whose rings would start crossing or touching themselves or whose parts or holes would end up inside one another is left unchanged and listed, also when it was invalid before (as already invalid). As with Simplify, shared boundaries can open gaps or overlaps, and the message says so, and the results are checked for crossing rings within the same budget (the refusal of [Simplify](#simplify)).
 
 **Message.** *Smoothed 2 features (2 iterations; 40 → 160 vertices).*
 
@@ -610,7 +612,7 @@ New vertices lie exactly on the polygon's edges; parts share bit-identical verti
 - *The number of parts must be a whole number from 2 to 1000, not 1* (script `parts` out of range or fractional)
 - *Select the polygons to divide in the active layer. (feature 12: the polygon has no area)*; *(feature 12: the cut misses it)*
 - *(feature 12: the parcel is 1070 km across in UTM 35N; ellipsoidal areas are guaranteed to 1 ppm on parcels up to 1000 km. Split it first, or divide it with the Divide Parcel tool and areaMode "Planar" (areas in the frame's plane))*
-- *Dividing 250 polygon(s) with 9 000 vertices into 4 parts is more than one command can do. Select fewer polygons, or use the Divide Parcel tool (it handles whole layers).* The check counts the vertices, the parts and, for very large parcels, the length of the edges and cuts, which are measured on the ellipsoid in pieces of 5 km: a 1000 km square goes into at most about 80 parts.
+- *Dividing 250 polygon(s) with 9 000 vertices into 4 parts is more than one command can do. Select fewer polygons, or use the Divide Parcel tool (it handles whole layers).* The check counts the vertices, the parts and, for very large parcels, the length of the edges and cuts, which are measured on the ellipsoid in pieces of 5 km: a 1000 km square goes into at most about 80 parts. Once the cuts are placed, and before anything is cut, it also counts how often they cross the edges: a comb of 250 teeth (1 001 vertices) cut across its teeth goes into at most 3 parts, each cut crossing 500 edges. The parts are counted again as cut, before the first write. Topological editing gets what is left of the command after the division, the parts' writes and the vertices shared between the divided polygons: a neighbouring layer that does not fit is left unchanged and named in the message (*…; shared vertices not added in 'buildings': the layer is too large to search in the same command (select fewer features or turn off Topological editing)*).
 
 ```sh
 rustgis-cli run --plugin advanced-editing-0.1.1.rgplugin --data parcels.gpkg \
@@ -660,11 +662,11 @@ rustgis-cli run --plugin advanced-editing-0.1.1.rgplugin --data parcels.gpkg \
 
 **Output.** A new layer *&lt;input&gt; divided* with one feature per part: the source's attributes (except `id`, `fid` and `ogc_fid`) plus `src_id` (the source feature's id, or its index), `part` (1, 2, … along the sweep) and `area_m2` (per the area mode, rounded to 0.0001 m²); these three override source fields of the same names. With *Parts of given area*, a remainder within the area tolerance is not a part of its own.
 
-**Messages.** A summary, *Divided 12 of 12 parcels into 57 parts (ellipsoidal area, largest error 0.0003 m²).*, then one line per parcel (up to 150): *Parcel 405: 5 parts, 2696.62, … m².* A parcel that cannot be divided is skipped with its reason: *Parcel 17 skipped: the parcel (812.40 m²) is not larger than one part (1000.00 m²).*
+**Messages.** A summary, *Divided 12 of 12 parcels into 57 parts (ellipsoidal area, largest error 0.0003 m²).*, then one line per parcel (up to 150): *Parcel 405: 5 parts, 2696.62, … m².* A parcel that cannot be divided is skipped with its reason: *Parcel 17 skipped: the parcel (812.40 m²) is not larger than one part (1000.00 m²).* The 150 lines include the skipped parcels; the skipped ones beyond them are counted in a last line: *… and 151 more parcels skipped.*
 
 **Per-parcel reasons**: *the parcel (… m²) is not larger than one part (… m²)*, *… m² would give more than 10000 parts*, *… m strips would give more than 10000 parts*, *the parcel is only … m wide across the lines*, *the polygon has no area*, *the parcel is … km across in …; ellipsoidal areas are guaranteed to 1 ppm on parcels up to 1000 km. Split it first, or divide it with the Divide Parcel tool and areaMode "Planar" (areas in the frame's plane)*.
 
-**Refusals**: *Count must be a whole number from 2 to 10000, not 1*; *Area must be positive, not 0*; *Width must be positive, not -5*; *'area' is required for the division 'parts of given area'*; *unknown division '…'*; *unknown area mode '…'*; *Nothing to divide in 'parcels': …* (no part at all); the budget check *Dividing … polygon(s) with … vertices into about … parts is more than one run of the tool can do. Select fewer polygons or ask for fewer parts.* The tool runs with 60 times a command's budget (a 1000 km square into almost 5000 parts).
+**Refusals**: *Count must be a whole number from 2 to 10000, not 1*; *Area must be positive, not 0*; *Width must be positive, not -5*; *'area' is required for the division 'parts of given area'*; *unknown division '…'*; *unknown area mode '…'*; *Nothing to divide in 'parcels': …* (no part at all); the budget check *Dividing … polygon(s) with … vertices into about … parts is more than one run of the tool can do. Select fewer polygons or ask for fewer parts.*, made first from the input's size alone (every feature into at least Count parts, or 2), before any parcel is prepared, then with the parcels' areas and extents, and again once the cuts are placed and their crossings with the edges counted; a parcel that cannot be divided still counts for reading and preparing it. The layer it makes is limited to about 64 MB of GeoJSON, every part with its parcel's attributes, checked with the budget from the input's size and again with the parcels' areas and extents: *Dividing 1 polygon(s) into about 1 000 parts would make a layer of about 1 001 MB, every part with its parcel's attributes; one run of the tool makes at most 64 MB. Select fewer polygons, ask for fewer parts, or leave large attributes out of the input.* The tool runs with 60 times a command's budget (a 1000 km square into almost 5000 parts).
 
 ```sh
 rustgis-cli run --plugin advanced-editing-0.1.1.rgplugin --data parcels.gpkg \
